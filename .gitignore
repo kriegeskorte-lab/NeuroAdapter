@@ -1,0 +1,87 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment
+env/
+venv/
+ENV/
+env.bak/
+.venv/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints
+
+# PyInstaller
+*.spec
+
+# VS Code
+.vscode/
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Test output
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+.cache
+.pytest_cache/
+
+# MyPy / Pyright
+.mypy_cache/
+.dmypy.json
+.pyre/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+*.egg
+*.whl
+
+# Logs
+*.log
+
+# Configs / local environment
+.env
+.env.*
+*.local
+
+# Git metadata
+*.orig
+
+# Python virtualenv wrapper
+.python-version
+
+# Jupyter runtime
+~$*
+
+# System Files
+*.bak
+*.swp
+*.swo
+*.tmp
+*.temp
+
+whole_brain_encoder/*
+!whole_brain_encoder/.gitkeep
+
+brain_adapter/decoded_stimuli/*
+!brain_adapter/decoded_stimuli/.gitkeep
+
+brain_adapter/model_weights/*
+!brain_adapter/model_weights/.gitkeep
+
+brain_adapter/plotted_stimuli/*
+!brain_adapter/plotted_stimuli/.gitkeep
+
+wandb/
