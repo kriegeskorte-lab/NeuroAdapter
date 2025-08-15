@@ -45,7 +45,7 @@ else:
     from brain_adapter.ip_adapter.attention_processor import IPAttnProcessor, AttnProcessor
 
 from brain_adapter.model import GuidanceGenerator
-from brain_adapter.dataset import nsd_topk_parcel_dataset
+from brain_adapter.dataset import nsd_topk_parcel_dataset, nsd_groupwise_topk_parcel_dataset
 
 # os.chdir("/engram/nklab/pf2477/brain_decoding/whole_brain_encoder")
 from whole_brain_encoder.brain_encoder_wrapper import BrainEncoderWrapper
@@ -71,6 +71,12 @@ class BrainIPAdapter(torch.nn.Module):
 
         if ckpt_path is not None:
             self.load_ip_adapter()
+            
+        self.cross_attn_maps = {}  # Store cross-attention outputs
+        self._register_block_hook()
+        
+    def _register_block_hook(self):
+        pass
 
     def forward(self, noisy_latents, timesteps, encoder_hidden_states, brain_embeds):
         """
@@ -203,7 +209,7 @@ def setup_ip_adapter_modules(args, unet, num_tokens=200):
     # Create image projection model
     image_proj_model = ImageProjModel(
         cross_attention_dim=unet.config.cross_attention_dim,
-        clip_embeddings_dim=args.conditioning_dim,
+        clip_embeddings_dim=args.condition_dim,
         clip_extra_context_tokens=num_tokens,
     )
 
@@ -284,7 +290,11 @@ def create_test_dataset(
         gen_size=512,
     )
 
-    test_dataset = nsd_topk_parcel_dataset(dataset_args, split="test", transform=None, topk=topk)
+    if args.multi_subject_training:
+        test_dataset = nsd_groupwise_topk_parcel_dataset(
+            dataset_args, split="test", transform=None, topk=topk, test_subj=args.subject_id)
+    else:
+        test_dataset = nsd_topk_parcel_dataset(dataset_args, split="test", transform=None, topk=topk)
     total_samples = len(test_dataset)
     
     print(f"Test dataset created with {total_samples} total samples, using top {topk} parcels per hemisphere.")
@@ -413,11 +423,18 @@ def save_individual_results(
     
     # Create evaluation mode specific directory
     if args.eval_full_dataset:
-        eval_dir = os.path.join(epoch_dir, "full")
+        base_eval_dir = os.path.join(epoch_dir, "full")
         mode_name = "full_dataset"
     else:
-        eval_dir = os.path.join(epoch_dir, "subset")
+        base_eval_dir = os.path.join(epoch_dir, "subset")
         mode_name = f"subset_{evaluation_indices[0]}_{evaluation_indices[1]-1}"
+    
+    # For multi-subject training, add subject-specific subdirectory
+    if args.multi_subject_training:
+        eval_dir = os.path.join(base_eval_dir, str(args.subject_id))
+        mode_name = f"{mode_name}_subj{args.subject_id}"
+    else:
+        eval_dir = base_eval_dir
     
     Path(eval_dir).mkdir(parents=True, exist_ok=True)
     
@@ -430,10 +447,11 @@ def save_individual_results(
         'num_predictions': args.num_predictions,
         'noise_factor': args.noise_factor,
         'topk': args.topk,
-        'conditioning_dim': args.conditioning_dim,
+        'condition_dim': args.condition_dim,
         'num_decoder_queries': args.num_decoder_queries,
         'sub_approach': args.sub_approach,
         'subject_id': args.subject_id,
+        'multi_subject_training': args.multi_subject_training,
         'evaluation_mode': 'full_dataset' if args.eval_full_dataset else 'indices',
         'start_idx': evaluation_indices[0],
         'end_idx': evaluation_indices[1],
@@ -595,6 +613,10 @@ def run_diffusion(brain_embeds, img_ip, models_dict, num_predictions=1, noise_fa
     
     encoder_hidden_states = text_encoder(text_input_ids)[0].to(device, dtype=weight_dtype)
     encoder_hidden_states = encoder_hidden_states.repeat(num_predictions, 1, 1)
+    
+    # Clean up text input ids immediately
+    del text_input_ids
+    torch.cuda.empty_cache()
 
     # Setup diffusion timesteps
     num_inference_steps = 50
@@ -612,6 +634,8 @@ def run_diffusion(brain_embeds, img_ip, models_dict, num_predictions=1, noise_fa
         noise = torch.randn(init_latents.shape).to(device, dtype=weight_dtype)
         noised_latents = noise_scheduler.add_noise(init_latents, noise, timesteps[:1])
         latents.append(noised_latents)
+        # Clean up noise tensor immediately
+        del noise
     latents = torch.cat(latents, dim=0)
 
     # Diffusion denoising process
@@ -621,22 +645,32 @@ def run_diffusion(brain_embeds, img_ip, models_dict, num_predictions=1, noise_fa
         )
         # Apply classifier-free guidance
         noise_pred = noise_pred_uncond + noise_factor * (noise_pred_cond - noise_pred_uncond)
+        
+        # Clean up intermediate predictions
+        del noise_pred_uncond, noise_pred_cond
+        
         latents = noise_scheduler.step(noise_pred, t, latents).prev_sample
+        
+        # Clean up noise prediction
+        del noise_pred
+        
+        # More frequent memory cleanup during diffusion
+        if (i + 1) % 10 == 0:
+            torch.cuda.empty_cache()
 
     # Decode latents to images
     latents = 1 / vae.config.scaling_factor * latents
     with torch.autocast(device_type=device.type):
         pred_image = vae.decode(latents).sample
 
-    # Post-process images
+    # Post-process images and move to CPU immediately
     pred_image = (pred_image / 2 + 0.5).clamp(0, 1)
     pred_image = pred_image.cpu().permute(0, 2, 3, 1).numpy()
     pred_image = (pred_image * 255).round().astype("uint8")
     
-    # Clean up intermediate tensors
+    # Clean up all intermediate tensors
     del latents, init_latents, encoder_hidden_states
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    torch.cuda.empty_cache()
 
     return pred_image
 
@@ -672,7 +706,12 @@ def preprocess_image(image, target_size, device="cpu"):
         transforms.Resize(target_size),
         transforms.ToTensor(),
     ])
-    return transform(image).to(device)
+
+    # Because the we normalize the ground truth into [0, 1] via min-max scaling
+    # we also need to ensure the generated images are in the same range
+    img_transformed = transform(image)
+    img_normalized = (img_transformed - img_transformed.min()) / (img_transformed.max() - img_transformed.min())
+    return img_normalized.to(device)
 
 
 def process_brain_data_for_correlation(batch, test_dataset, brain_encoder_predictions, device):
@@ -696,7 +735,11 @@ def process_brain_data_for_correlation(batch, test_dataset, brain_encoder_predic
     
     for hemisphere in ["lh", "rh"]:
         for parcel_idx, parcel_id in enumerate(test_dataset.selected_parcel_idx[hemisphere]):
-            voxel_indices = test_dataset.parcels[hemisphere][parcel_id]
+            if test_dataset.__class__.__name__ == "nsd_groupwise_topk_parcel_dataset":
+                subject_id = test_dataset.subjects[0]
+                voxel_indices = test_dataset.parcels[subject_id][hemisphere][parcel_id]
+            else:   
+                voxel_indices = test_dataset.parcels[hemisphere][parcel_id]
             num_voxels = len(voxel_indices)
             
             # Ground truth brain activity for this parcel
@@ -745,10 +788,10 @@ def decode_images_from_brain(dataloader, models_dict, brain_encoder, test_datase
     
     with torch.no_grad():
         for batch_idx, batch in enumerate(tqdm(dataloader, desc="Decoding brain signals")):
-            # Get original image
+            # Get original image and move to CPU immediately
             img = batch["img_encoder"].squeeze()  # Remove batch dimension
             img = (img - img.min()) / (img.max() - img.min())  # Normalize to [0, 1]
-            original_images.append(img)
+            original_images.append(img.cpu())  # Ensure it's on CPU
             
             # Get dataset index for this sample
             if hasattr(dataloader.dataset, 'indices'):
@@ -763,6 +806,9 @@ def decode_images_from_brain(dataloader, models_dict, brain_encoder, test_datase
             rh = batch["brain_rh_f"].to(device, dtype=weight_dtype)
             brain_data = torch.cat([lh, rh], dim=1)
             
+            # Clean up individual hemisphere data
+            del lh, rh
+            
             # Validate brain data dimensions
             assert brain_data.shape[1] == test_dataset.num_parcels, \
                 f"Expected {test_dataset.num_parcels} parcels, got {brain_data.shape[1]}"
@@ -771,6 +817,9 @@ def decode_images_from_brain(dataloader, models_dict, brain_encoder, test_datase
 
             # Generate brain conditioning tokens
             brain_embeds, _ = guidance_generator(brain_data)
+            
+            # Clean up brain_data after getting embeddings
+            del brain_data
 
             # Use zero-filled image as initialization (no image information)
             img_init = batch["img_ipadapter"].to(device, dtype=weight_dtype)
@@ -781,6 +830,10 @@ def decode_images_from_brain(dataloader, models_dict, brain_encoder, test_datase
                 brain_embeds, img_init, models_dict, 
                 num_predictions=num_predictions, noise_factor=noise_factor
             )
+            
+            # Clean up after diffusion
+            del brain_embeds, img_init
+            torch.cuda.empty_cache()
 
             # Get brain encoder predictions for all candidates
             brain_predictions = brain_encoder.forward(candidate_images)
@@ -811,10 +864,21 @@ def decode_images_from_brain(dataloader, models_dict, brain_encoder, test_datase
                 candidate_images_list.append(None)
                 correlation_scores_list.append(None)
             
-            # Clean up GPU memory after each sample to prevent accumulation
+            # Clean up all GPU tensors for this iteration
             del brain_predictions, ground_truth, predictions, correlations
-            if torch.cuda.is_available():
+            del candidate_images  # This is already numpy, but cleanup anyway
+            
+            # Force garbage collection every few iterations
+            if (batch_idx + 1) % 5 == 0:
                 torch.cuda.empty_cache()
+                import gc
+                gc.collect()
+            
+            # Print memory usage periodically for monitoring
+            if (batch_idx + 1) % 20 == 0 and torch.cuda.is_available():
+                memory_allocated = torch.cuda.memory_allocated(device) / 1024**3
+                memory_reserved = torch.cuda.memory_reserved(device) / 1024**3
+                print(f"  Batch {batch_idx + 1}: GPU memory allocated: {memory_allocated:.2f}GB, reserved: {memory_reserved:.2f}GB")
 
     # Stack all images
     original_images = torch.stack(original_images, dim=0)
@@ -847,6 +911,12 @@ def main():
     print(f"Top-k parcels: {args.topk}")
     print("=" * 50)
 
+    # For full dataset evaluation, reduce batch size and predictions to save memory
+    if args.eval_full_dataset and args.batch_size > 1:
+        print(f"Warning: For full dataset evaluation, consider using batch_size=1 to avoid memory issues")
+    
+    if args.eval_full_dataset and args.num_predictions > 4:
+        print(f"Warning: For full dataset evaluation, consider reducing num_predictions to 4 or less")
     
     # Load pre-trained models
     print("Loading diffusion models...")
@@ -880,7 +950,7 @@ def main():
         num_parcels=test_dataset.num_parcels,
         max_voxels=test_dataset.max_voxels,
         num_decoder_queries=args.num_decoder_queries,
-        output_dim=args.conditioning_dim,
+        output_dim=args.condition_dim,
         sub_approach=args.sub_approach,
     )
 
@@ -915,6 +985,12 @@ def main():
     print(f"Models moved to device: {device}")
     print(f"Target weight dtype: {weight_dtype}")
     print("Models prepared successfully")
+
+    # Clear any cached memory after model loading
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        initial_memory = torch.cuda.memory_allocated(device) / 1024**3
+        print(f"Initial GPU memory usage: {initial_memory:.2f}GB")
 
     # Load brain encoder for evaluation
     print("Loading brain encoder...")
@@ -961,6 +1037,7 @@ def main():
             save_all_candidates=save_candidates
         )
         print("Decoding completed successfully")
+        pass
     except Exception as e:
         print(f"Error during decoding: {e}")
         return 1
@@ -1038,7 +1115,12 @@ def create_argument_parser():
         default=True,
         help="Evaluate on specific indices (default behavior)"
     )
-    
+
+    parser.add_argument(
+        "--multi_subject_training",
+        action="store_true",
+        help="Replace the dataset with shared parcel indices for multi-subject training"
+    )
     parser.add_argument(
         "--start_idx", 
         type=int, 
@@ -1066,7 +1148,7 @@ def create_argument_parser():
     parser.add_argument(
         "--noise_factor", 
         type=float, 
-        default=4.0,
+        default=1.0,
         help="Classifier-free guidance scale for diffusion"
     )
     parser.add_argument(
@@ -1094,7 +1176,7 @@ def create_argument_parser():
         help="Number of decoder queries for guidance generator"
     )
     parser.add_argument(
-        "--conditioning_dim",
+        "--condition_dim",
         type=int,
         default=768,
         help="Conditioning dimension for guidance generator"
@@ -1116,50 +1198,82 @@ def create_argument_parser():
 
 
 if __name__ == "__main__":
+    main()
     """
     Usage Examples:
     
     # 1. Evaluate specific indices (saves to subset/ folder):
     python decode_brain_adapter.py \
-        --model_weights_dir brain_adapter/model_weights/07_26_2025-22_29 \
-        --saved_epochs 100 \
+        --model_weights_dir brain_adapter/model_weights/08_14_2025-00_21 \
+        --saved_epochs 200 \
         --start_idx 0 \
         --end_idx 8 \
-        --num_predictions 8 \
+        --num_predictions 4 \
+        --noise_factor 2.0 \
         --subject_id 1 \
         --topk 100 \
         --num_decoder_queries 50 \
-        --conditioning_dim 768 \
-        --sub_approach transformer_decoder
+        --condition_dim 768 \
+        --sub_approach linear_projection
     
     # 2. Evaluate subset with all candidates saved:
     python decode_brain_adapter.py \
-        --model_weights_dir brain_adapter/model_weights/07_28_2025-01_26 \
-        --saved_epochs 70 \
+        --model_weights_dir brain_adapter/model_weights/08_14_2025-00_21 \
+        --saved_epochs 200 \
         --start_idx 0 \
-        --end_idx 16 \
+        --end_idx 8 \
         --num_predictions 4 \
+        --noise_factor 2.0 \
         --save_all_candidates \
         --subject_id 1 \
-        --topk 50 \
+        --topk 100 \
+        --condition_dim 768 \
         --num_decoder_queries 50 \
-        --conditioning_dim 192 \
         --sub_approach linear_projection
     
     # 3. Evaluate entire test dataset (saves to full/ folder):
     python decode_brain_adapter.py \
-        --model_weights_dir brain_adapter/model_weights/07_26_2025-22_29 \
-        --saved_epochs 100 \
+        --model_weights_dir brain_adapter/model_weights/08_03_2025-17_39 \
+        --saved_epochs 200 \
         --eval_full_dataset \
         --batch_size 1 \
-        --num_predictions 2 \
+        --num_predictions 4 \
         --subject_id 1 \
         --topk 100 \
         --num_decoder_queries 50 \
-        --conditioning_dim 768 \
-        --sub_approach transformer_decoder
+        --condition_dim 768 \
+        --sub_approach linear_projection
+    
+    # 4. Multi-subject training evaluation:
+    python decode_brain_adapter.py \
+        --model_weights_dir brain_adapter/model_weights/08_14_2025-00_21 \
+        --saved_epochs 100 \
+        --save_all_candidates \
+        --multi_subject_training \
+        --start_idx 0 \
+        --end_idx 8 \
+        --subject_id 8 \
+        --num_predictions 4 \
+        --noise_factor 2.0 \
+        --topk 100 \
+        --num_decoder_queries 50 \
+        --condition_dim 768 \
+        --sub_approach linear_projection
+        
+    python decode_brain_adapter.py \
+        --model_weights_dir brain_adapter/model_weights/08_10_2025-15_50 \
+        --saved_epochs 100 \
+        --multi_subject_training \
+        --eval_full_dataset \
+        --subject_id 1 \
+        --num_predictions 4 \
+        --topk 100 \
+        --num_decoder_queries 50 \
+        --condition_dim 768 \
+        --sub_approach linear_projection
     
     # Output Structure:
+    # Single-subject training:
     # decoded_stimuli/
     # └── model_name/
     #     └── epoch_100/
@@ -1175,7 +1289,25 @@ if __name__ == "__main__":
     #             ├── ...
     #             ├── evaluation_metadata.json
     #             └── sample_summary.json
+    #
+    # Multi-subject training (--multi_subject_training):
+    # decoded_stimuli/
+    # └── model_name/
+    #     └── epoch_100/
+    #         ├── full/           # Full dataset evaluation
+    #         │   └── 1/          # Subject-specific subdirectory
+    #         │       ├── sample_000001.npz
+    #         │       ├── sample_000002.npz
+    #         │       ├── ...
+    #         │       ├── evaluation_metadata.json
+    #         │       └── sample_summary.json
+    #         └── subset/         # Subset evaluation
+    #             └── 1/          # Subject-specific subdirectory
+    #                 ├── sample_000001.npz
+    #                 ├── sample_000002.npz
+    #                 ├── ...
+    #                 ├── evaluation_metadata.json
+    #                 └── sample_summary.json
+    #
+    # plotted_stimuli/ follows the same structure as decoded_stimuli/
     """
-    import sys
-    exit_code = main()
-    sys.exit(exit_code)

@@ -449,16 +449,14 @@ class nsd_topk_parcel_dataset(Dataset):
 
         # Process text
         text = ""
-        if self.tokenizer is None:
-            text_input_ids = torch.zeros(1, dtype=torch.long)
-        else:
-            text_input_ids = self.tokenizer(
-                text,
-                max_length=self.tokenizer.model_max_length,
-                padding="max_length",
-                truncation=True,
-            return_tensors="pt",
-        ).input_ids
+        # text_input_ids = self.tokenizer(
+        #     text,
+        #     max_length=self.tokenizer.model_max_length,
+        #     padding="max_length",
+        #     truncation=True,
+        #     return_tensors="pt",
+        # ).input_ids
+        text_input_ids = torch.zeros(1, dtype=torch.long)
 
         return {
             "img_encoder": img,
@@ -481,7 +479,6 @@ class nsd_groupwise_topk_parcel_dataset(Dataset):
             test_subj: subject ID for test/val splits (1-8), ignored for train split
         """
         assert topk > 0, "topk must be positive"
-        
         self.args = args
         self.transform = transform
         self.split = split
@@ -725,16 +722,14 @@ class nsd_groupwise_topk_parcel_dataset(Dataset):
         
         # Process text (empty for now)
         text = ""
-        if self.tokenizer is None:
-            text_input_ids = torch.zeros(1, dtype=torch.long)
-        else:
-            text_input_ids = self.tokenizer(
-                text,
-                max_length=self.tokenizer.model_max_length,
-                padding="max_length",
-                truncation=True,
-            return_tensors="pt",
-        ).input_ids
+        # text_input_ids = self.tokenizer(
+        #     text,
+        #     max_length=self.tokenizer.model_max_length,
+        #     padding="max_length",
+        #     truncation=True,
+        #     return_tensors="pt",
+        # ).input_ids
+        text_input_ids = torch.zeros(1, dtype=torch.long)
         
         return {
             "img_encoder": img,
@@ -746,59 +741,39 @@ class nsd_groupwise_topk_parcel_dataset(Dataset):
         
 def get_dominant_roi_per_parcel(dataset, metadata, all_roi_names, min_overlap_threshold=0.1):
     """
-    Matrix-based computation for maximum speed.
-    """
-    import scipy.sparse as sp
-    from tqdm import tqdm
+    Get the dominant ROI for each selected parcel.
     
+    Args:
+        dataset: nsd_topk_parcel_dataset instance
+        metadata: subject metadata
+        all_roi_names: list of ROI names
+        min_overlap_threshold: minimum overlap ratio to consider a match
+    
+    Returns:
+        dict: {hemi: [(parcel_idx, dominant_roi, overlap_ratio), ...]}
+    """
     schaefer_voxel_indices = dataset.get_selected_voxel_indices()
     dominant_rois = {"lh": [], "rh": []}
     
     for hemi in ['lh', 'rh']:
-        # Get hemisphere size
-        first_roi = next(iter(metadata[f'{hemi}_rois'].values()))
-        hemi_size = len(first_roi)
-        
-        # Create sparse matrices for all ROIs
-        roi_names_list = []
-        roi_matrices = []
-        
-        for roi in all_roi_names:
-            if f'{hemi}_rois' in metadata and roi in metadata[f'{hemi}_rois']:
-                roi_mask = np.array(metadata[f'{hemi}_rois'][roi], dtype=bool)
-                roi_matrices.append(roi_mask)
-                roi_names_list.append(roi)
-        
-        # Stack all ROI masks into a matrix: [n_rois, n_voxels]
-        roi_matrix = np.stack(roi_matrices, axis=0) if roi_matrices else np.empty((0, hemi_size))
-        
-        print(f"Processing {len(schaefer_voxel_indices[hemi])} {hemi.upper()} parcels with matrix operations...")
-        
-        for parcel_idx, voxel_idxs in enumerate(tqdm(schaefer_voxel_indices[hemi], desc=f"{hemi.upper()}")):
-            # Create parcel mask
-            parcel_mask = np.zeros(hemi_size, dtype=bool)
-            parcel_mask[voxel_idxs.numpy()] = True
+        for parcel_idx, voxel_idxs in enumerate(schaefer_voxel_indices[hemi]):
+            schaefer_voxels = set(voxel_idxs.numpy())
             
-            # Compute overlaps with all ROIs at once
-            overlaps = np.sum(roi_matrix & parcel_mask[None, :], axis=1)
-            overlap_ratios = overlaps / len(voxel_idxs) if len(voxel_idxs) > 0 else np.zeros_like(overlaps)
+            best_roi = None
+            best_overlap = 0
             
-            # Find best overlap above threshold
-            valid_overlaps = overlap_ratios >= min_overlap_threshold
-            if np.any(valid_overlaps):
-                best_idx = np.argmax(overlap_ratios)
-                if overlap_ratios[best_idx] >= min_overlap_threshold:
-                    best_roi = roi_names_list[best_idx]
-                    best_overlap = overlap_ratios[best_idx]
-                else:
-                    best_roi = None
-                    best_overlap = 0
-            else:
-                best_roi = None
-                best_overlap = 0
+            for roi in all_roi_names:
+                if f'{hemi}_rois' in metadata and roi in metadata[f'{hemi}_rois']:
+                    roi_voxels = set([id for id, val in enumerate(metadata[f'{hemi}_rois'][roi]) if val == True])
+                    overlap = len(schaefer_voxels.intersection(roi_voxels))
+                    overlap_ratio = overlap / len(schaefer_voxels)
+                    
+                    if overlap_ratio > best_overlap and overlap_ratio >= min_overlap_threshold:
+                        best_overlap = overlap_ratio
+                        best_roi = roi
             
             parcel_original_idx = dataset.selected_parcel_idx[hemi][parcel_idx]
-            dominant_rois[hemi].append((parcel_original_idx, best_roi, best_overlap, len(voxel_idxs)))
+            dominant_rois[hemi].append((parcel_original_idx, best_roi, best_overlap))
     
     return dominant_rois
         
@@ -875,9 +850,9 @@ if __name__ == "__main__":
     roi = all_roi_names[0]
     print(metadata['lh_rois'][roi])
     print(len(metadata['lh_rois'][roi]))
-    # print([id for id, val in enumerate(metadata['lh_rois'][roi]) if val == True])
+    print([id for id, val in enumerate(metadata['lh_rois'][roi]) if val == True])
     
-    dominant_rois = get_dominant_roi_per_parcel(train_dataset, metadata, all_roi_names, min_overlap_threshold=0.5)
+    dominant_rois = get_dominant_roi_per_parcel(train_dataset, metadata, all_roi_names)
     
     print("\n" + "="*50)
     print("DOMINANT ROI PER PARCEL (>10% overlap)")
@@ -885,12 +860,8 @@ if __name__ == "__main__":
     
     for hemi in ['lh', 'rh']:
         print(f"\n{hemi.upper()} Hemisphere:")
-        cnt = 0
-        for parcel_idx, roi_name, overlap, num_voxels in dominant_rois[hemi]:
+        for parcel_idx, roi_name, overlap in dominant_rois[hemi]:
             if roi_name:
-                print(f"Parcel {parcel_idx:3d}: {roi_name:20s} ({overlap:.1%}) in {num_voxels} Schaefer voxels")
-                cnt += 1
-                
-        print(f"Total parcels with dominant ROI in {hemi.upper()}: {cnt}")
-            # else:
-            #     print(f"Parcel {parcel_idx:3d}: No dominant ROI")
+                print(f"Parcel {parcel_idx:3d}: {roi_name:20s} ({overlap:.1%})")
+            else:
+                print(f"Parcel {parcel_idx:3d}: No dominant ROI")

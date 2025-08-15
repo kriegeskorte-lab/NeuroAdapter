@@ -6,6 +6,16 @@ import torch.nn.functional as F
 import math
 
 from brain_adapter.transformer import Transformer
+from brain_adapter.ip_adapter.utils import is_torch2_available
+
+if is_torch2_available():
+    from brain_adapter.ip_adapter.attention_processor import (
+        IPAttnProcessor2_0 as IPAttnProcessor, 
+        AttnProcessor2_0 as AttnProcessor
+    )
+else:
+    from brain_adapter.ip_adapter.attention_processor import IPAttnProcessor, AttnProcessor
+
 
 '''
 ParcelMapper: Map raw fMRI data to fixed-dim tokens per parcel.
@@ -34,43 +44,7 @@ class ParcelMapper(nn.Module):
 '''
 Transformer Decoder Architecture
 '''
-# class TokenMapper(nn.Module):
-#     def __init__(self, 
-#                  num_parcels=200,
-#                  num_decoder_queries=50, 
-#                  d_model=768,
-#                  num_decoder_layers=1,
-#                  nhead=8,
-#                  dropout=0.1):
-#         super().__init__()
-        
-#         # Learnable queries for the decoder
-#         self.decoder_queries = nn.Embedding(num_decoder_queries, d_model) 
-#         self.roi_embeddings = nn.Embedding(num_parcels, d_model) 
 
-#         # Only transformer decoder: queries attend to fMRI tokens
-#         decoder_layer = nn.TransformerDecoderLayer(d_model=d_model, nhead=nhead, dropout=dropout, batch_first=True)
-#         self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=num_decoder_layers)
-
-#     def forward(self, fmri_tokens):
-#         """
-#         fmri_tokens: [B, num_fmri_tokens, d_model] 
-#         returns: [B, num_decoder_queries, d_model]
-#         """  
-#         B, num_parcels, d_model = fmri_tokens.shape
-#         num_queries = self.decoder_queries.num_embeddings
-
-#         pos_embeddings = self.roi_embeddings.weight.unsqueeze(0).repeat(B, 1, 1)  # [B, num_parcels, d_model]
-#         keys = fmri_tokens + pos_embeddings  # [B, d_model, num_parcels]
-#         queries = self.decoder_queries.weight.unsqueeze(0).repeat(B, 1, 1)  # [B, num_queries, d_model]
-
-#         condition_tokens = self.decoder(
-#             tgt=queries,
-#             memory=keys,
-#         ) # [B, num_queries, d_model]
-
-#         return condition_tokens
-    
 class TokenMapper(nn.Module):
     def __init__(self, 
                  num_parcels=200,
@@ -197,6 +171,12 @@ class NeuroAdapter(torch.nn.Module):
 
         if ckpt_path is not None:
             self.load_from_checkpoint(ckpt_path)
+            
+        self.cross_attn_maps = {}  # Store cross-attention outputs
+        self._register_block_hook()
+                
+    def _register_block_hook(self):
+        pass
 
     def forward(
         self,
@@ -217,19 +197,25 @@ class NeuroAdapter(torch.nn.Module):
         Returns:
             noise_pred:           [B, C, H, W] predicted noise residual.
         """
+        self.cross_attn_maps.clear() 
+        
         # 1) Project fMRI tokens into U-Net’s attention key/value space:
         #    ip_tokens.shape == [B, N, cross_attention_dim]
         ip_tokens = self.image_proj_model(condition_tokens)
 
         # 2) Concatenate with (possibly empty) text embeddings along token axis:
-        #    combined.shape == [B, L_text + N, D_text]
+        #    combined.shape == [B, L_text + N, D_text], L_text = 77
+        #    Even if the string is empty, the encoder_hidden_states
+        # We let the model learn to ignore empty text embeddings
         encoder_states = torch.cat([encoder_hidden_states, ip_tokens], dim=1)
 
         # 3) Run the U-Net denoiser with our combined context:
         #    .sample is the predicted noise residual
-        noise_pred = self.unet(noisy_latents, timesteps, encoder_states).sample
+        out = self.unet(noisy_latents, timesteps, encoder_states, return_dict=True)
+        noise_pred = out.sample
 
-        return noise_pred
+        return noise_pred, self.cross_attn_maps
+        # return noise_pred
 
     def load_from_checkpoint(self, ckpt_path: str):
         """

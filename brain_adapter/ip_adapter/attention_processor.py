@@ -296,7 +296,7 @@ class IPAttnProcessor2_0(torch.nn.Module):
 
     def __init__(self, hidden_size, cross_attention_dim=None, scale=1.0, num_tokens=4):
         super().__init__()
-
+        
         if not hasattr(F, "scaled_dot_product_attention"):
             raise ImportError("AttnProcessor2_0 requires PyTorch 2.0, to use it, please upgrade PyTorch to 2.0.")
 
@@ -308,6 +308,8 @@ class IPAttnProcessor2_0(torch.nn.Module):
 
         self.to_k_ip = nn.Linear(cross_attention_dim or hidden_size, hidden_size, bias=False)
         self.to_v_ip = nn.Linear(cross_attention_dim or hidden_size, hidden_size, bias=False)
+        
+        self.ip_attn_map = None # hook for ip attention map
 
     def __call__(
         self,
@@ -389,9 +391,17 @@ class IPAttnProcessor2_0(torch.nn.Module):
         ip_hidden_states = F.scaled_dot_product_attention(
             query, ip_key, ip_value, attn_mask=None, dropout_p=0.0, is_causal=False
         )
-        with torch.no_grad():
-            self.attn_map = query @ ip_key.transpose(-2, -1).softmax(dim=-1)
-            
+        
+        # compute attention map [B, n_heads, N_queries, N_ip_tokens]
+        # can be used for visualization
+        is_train_mode = self.training                  # .train() vs .eval()
+        grads_on = torch.is_grad_enabled()             # no_grad() or not
+        in_training = is_train_mode and grads_on
+        if not in_training:
+            with torch.no_grad():
+                scale = query.shape[-1] ** -0.5
+                self.ip_attn_map = (scale * (query @ ip_key.transpose(-2, -1))).softmax(dim=-1)
+        
         ip_hidden_states = ip_hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
         ip_hidden_states = ip_hidden_states.to(query.dtype)
 
@@ -409,7 +419,11 @@ class IPAttnProcessor2_0(torch.nn.Module):
             hidden_states = hidden_states + residual
 
         hidden_states = hidden_states / attn.rescale_output_factor
+        
 
+        self.hidden_states = None
+        self.hidden_states = hidden_states
+        
         return hidden_states
 
 ## for controlnet

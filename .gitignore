@@ -84,4 +84,15 @@ brain_adapter/model_weights/*
 brain_adapter/plotted_stimuli/*
 !brain_adapter/plotted_stimuli/.gitkeep
 
+brain_adapter/ip_adapter/checkpoints/*
+!brain_adapter/ip_adapter/checkpoints/.gitkeep
+
+brain_adapter/attn_maps/*
+!brain_adapter/attn_maps/.gitkeep
+
+brain_adapter/denoising_vis/*
+!brain_adapter/denoising_vis/.gitkeep
+
 wandb/
+
+logs/

@@ -29,13 +29,14 @@ warnings.filterwarnings("ignore")
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.optim.lr_scheduler import StepLR
+from torch.optim.lr_scheduler import StepLR, LambdaLR
 from tqdm import tqdm
 from pathlib import Path
 import wandb
 
 # Accelerate imports
 from accelerate import Accelerator, DistributedDataParallelKwargs
+from accelerate.utils import set_seed, synchronize_rng_states
 
 # Diffusion model imports
 from diffusers import AutoencoderKL, DDPMScheduler, UNet2DConditionModel
@@ -57,12 +58,14 @@ else:
 
 from brain_adapter.model import NeuroAdapter, GuidanceGenerator
 from brain_adapter.utils import str2bool
-from brain_adapter.dataset import nsd_topk_parcel_dataset
+from brain_adapter.dataset import nsd_topk_parcel_dataset, nsd_groupwise_topk_parcel_dataset
+from brain_adapter.loss import min_snr_loss_weights, dispersive_loss
 
 warnings.filterwarnings("ignore")
 
 def setup_accelerator(args):
     """Initialize the Accelerator for distributed training."""
+    set_seed(args.seed)
     # ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
     accelerator = Accelerator(
         cpu=False,
@@ -78,6 +81,7 @@ def setup_accelerator(args):
         project_dir=None,
         project_config=None,
     )
+    accelerator.wait_for_everyone()
     return accelerator
 
 
@@ -85,13 +89,14 @@ def setup_wandb_logging(args, accelerator):
     """Initialize Weights & Biases logging if enabled."""
     if accelerator.is_main_process and args.wandb:
         # Note: Consider moving the API key to environment variable for security
+        subj_info = args.subject_id if args.training_subjects is None else "_".join(map(str, args.training_subjects))
         wandb.login(key="fa2d96cf662daa2fc63a8242133501a23399a230")
         wandb.init(
             project="brain-decoding",
             entity='tonylovescode',
-            name=f"fMRI_subj{args.subject_id}_{args.time}",
+            name=f"fMRI_subj{subj_info}_{args.time}",
             config={
-                "subject_id": args.subject_id,
+                "subject_id": subj_info,
                 "learning_rate": args.learning_rate,
                 "batch_size": args.train_batch_size,
                 "epochs": args.num_train_epochs,
@@ -129,9 +134,8 @@ def setup_ip_adapter(unet, args):
     
     # Create image projection model for fMRI tokens
     image_proj_model = ImageProjModel(
-        cross_attention_dim=unet.config.cross_attention_dim,
+        cross_attention_dim=unet.config.cross_attention_dim, #768
         clip_embeddings_dim=args.condition_dim,
-        clip_extra_context_tokens=num_fmri_tokens,
     )
     
     # Initialize attention processor modules
@@ -180,7 +184,7 @@ def setup_ip_adapter(unet, args):
 def setup_dataset_and_dataloader(args, tokenizer):
     """Create dataset and dataloader for training."""
     dataset_args = SimpleNamespace(
-        subj=1,
+        subj=args.subject_id,
         backbone_arch="dinov2_q",
         data_dir="/engram/nklab/datasets/natural_scene_dataset/model_training_datasets/neural_data",
         imgs_dir="/engram/nklab/datasets/natural_scene_dataset/nsddata_stimuli/stimuli/nsd",
@@ -190,13 +194,22 @@ def setup_dataset_and_dataloader(args, tokenizer):
         gen_size=args.gen_img_resolution,
         num_decoder_queries=args.num_decoder_queries,
     )
-    
-    train_dataset = nsd_topk_parcel_dataset(
-        dataset_args, 
-        split='train', 
-        transform=None, 
-        topk=args.topk
-    )
+
+    if args.training_subjects is not None:
+        train_dataset = nsd_groupwise_topk_parcel_dataset(
+            dataset_args, 
+            split='train', 
+            transform=None, 
+            topk=args.topk, 
+            train_subj=args.training_subjects
+        )
+    else:
+        train_dataset = nsd_topk_parcel_dataset(
+            dataset_args,
+            split='train',
+            transform=None,
+            topk=args.topk
+        )
 
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
@@ -266,7 +279,7 @@ def apply_fmri_token_dropout(condition_tokens):
     roi_mask = (torch.rand(B, N) <= ratios).to(condition_tokens.device)
     roi_mask = roi_mask.view(B, N, 1)
     return condition_tokens * roi_mask
-
+ 
 
 def process_training_batch(batch, vae, noise_scheduler, text_encoder, guidance_generator, 
                           neuro_adapter, weight_dtype, accelerator, train_dataset):
@@ -306,15 +319,23 @@ def process_training_batch(batch, vae, noise_scheduler, text_encoder, guidance_g
     condition_tokens = apply_fmri_token_dropout(condition_tokens)
 
     # Get text embeddings
+    # WARNING: we can set this to None, otherwise the computation in IPAttnProcessor would be unsafe.
     with torch.no_grad():
         encoder_hidden_states = text_encoder(text_input_ids)[0]
     
     # Forward pass through adapted UNet
-    noise_pred = neuro_adapter(noisy_latents, timesteps, encoder_hidden_states, condition_tokens)
+    noise_pred, cross_attn_maps = neuro_adapter(noisy_latents, timesteps, encoder_hidden_states, condition_tokens)
+    # noise_pred = neuro_adapter(noisy_latents, timesteps, encoder_hidden_states, condition_tokens)
     
-    # Compute primary noise prediction loss
-    train_loss = F.mse_loss(noise_pred.float(), noise.float(), reduction="mean")
-
+    # # Compute primary noise prediction loss
+    # train_loss = F.mse_loss(noise_pred.float(), noise.float(), reduction="mean")
+    
+    loss = F.mse_loss(noise_pred.float(), noise.float(), reduction="none")
+    loss = loss.mean(dim=list(range(1, len(loss.shape))))  # Average over spatial dimensions
+    snr_weights = min_snr_loss_weights(timesteps, noise_scheduler, gamma=5.0)
+    loss = loss * snr_weights
+    train_loss = loss.mean()
+    
     return train_loss
 
 
@@ -383,10 +404,11 @@ def training_loop(args, accelerator, neuro_adapter, guidance_generator, train_da
             accelerator.save_state(save_path, safe_serialization=False)
             if accelerator.is_main_process:
                 tqdm.write(f"Saved checkpoint to {save_path}")
-            cleanup_checkpoints(args.output_dir, keep_last_n=2)
+                cleanup_checkpoints(args.output_dir, keep_last_n=1)
             
             
 def cleanup_checkpoints(output_dir, keep_last_n=3):
+    """Clean up old checkpoints, keeping only the last N. Safe for distributed training."""
     # List all checkpoint directories
     checkpoints = sorted(
         glob.glob(os.path.join(output_dir, "checkpoint-*")),
@@ -394,8 +416,14 @@ def cleanup_checkpoints(output_dir, keep_last_n=3):
     )
     # Delete older checkpoints, keep only the last N
     for checkpoint in checkpoints[:-keep_last_n]:
-        print(f"Deleting old checkpoint: {checkpoint}")
-        shutil.rmtree(checkpoint)
+        try:
+            if os.path.exists(checkpoint):
+                print(f"Deleting old checkpoint: {checkpoint}")
+                shutil.rmtree(checkpoint)
+        except (FileNotFoundError, OSError) as e:
+            # Another process may have already deleted this checkpoint
+            print(f"Checkpoint {checkpoint} already deleted or inaccessible: {e}")
+            continue
 
 
 def main(args):
@@ -407,14 +435,14 @@ def main(args):
     
     # Initialize training setup
     accelerator = setup_accelerator(args)
+    accelerator.print(f'Number of GPUs: {accelerator.state.num_processes}')
     setup_wandb_logging(args, accelerator)
     
     # Load pre-trained models
     noise_scheduler, tokenizer, text_encoder, vae, unet = load_pretrained_models(args)
-    
+
     # Set up IP-Adapter components
     image_proj_model, adapter_modules, num_fmri_tokens = setup_ip_adapter(unet, args)
-    accelerator.print(f"Training NeuroAdapter on subjecti {args.subject_id}")
     accelerator.print(f"Number of fMRI tokens: {num_fmri_tokens}")
     
     # Set up dataset and dataloader
@@ -437,7 +465,7 @@ def main(args):
     # lr_scheduler = StepLR(optimizer, step_size=25*steps_per_epoch, gamma=0.5)
     lr_scheduler = get_cosine_schedule_with_warmup(
         optimizer,
-        num_warmup_steps=0.05 * args.num_train_epochs * steps_per_epoch,
+        num_warmup_steps=0.1 * args.num_train_epochs * steps_per_epoch,
         num_training_steps=args.num_train_epochs * steps_per_epoch
     )
     
@@ -494,6 +522,13 @@ def create_argument_parser():
     
     # Training configuration
     parser.add_argument(
+        "--training_subjects",
+        nargs="+",         # one or more values, split on whitespace
+        type=int,          # convert each to int
+        default=None,
+        help="List of subject IDs to include (e.g. 1 2 3 4)"
+    )
+    parser.add_argument(
         "--learning_rate",
         type=float,
         default=1e-4,
@@ -502,7 +537,7 @@ def create_argument_parser():
     parser.add_argument(
         "--weight_decay", 
         type=float, 
-        default=1e-4, 
+        default=1e-5, 
         help="Weight decay for regularization."
     )
     parser.add_argument(
@@ -613,6 +648,18 @@ def create_argument_parser():
         action='store_true',
         help="Whether to use W&B for progress tracking"
     )
+    parser.add_argument(
+        "--time", 
+        type=str, 
+        default=None,
+        help="Timestamp for this training run"
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed for reproducibility. Default is 42.",
+    )
     
     return parser
 
@@ -627,16 +674,16 @@ if __name__ == "__main__":
     if env_local_rank != -1 and env_local_rank != args.local_rank:
         args.local_rank = env_local_rank
 
-    # Set timestamp for this training run
-    args.time = datetime.now().strftime("%m_%d_%Y-%H_%M")
-    
     # Create output directory if training (learning_rate > 0)
-    if args.output_dir is not None and args.learning_rate > 0:
+    if args.learning_rate > 0:
+        # 1) If time wasn’t passed in, generate it now
+        if args.time is None:
+            args.time = datetime.now().strftime("%m_%d_%Y-%H_%M")
+
+        # 2) Append the time to the base output_dir and make it
         args.output_dir = os.path.join(args.output_dir, args.time)
         os.makedirs(args.output_dir, exist_ok=True)
-        # print(f"Output directory: {args.output_dir}")
-        # print(f"Current directory: {os.getcwd()}")
-
+        
     # Start training
     main(args)
 
@@ -648,25 +695,50 @@ Usage Examples:
 accelerate launch --config_file acc_config.yaml train_brain_adapter.py \
     --learning_rate 0 \
     --num_train_epochs 1 \
-    --train_batch_size 8 \
+    --train_batch_size 16 \
     --dataloader_num_workers=8 \
     --subject_id 1 \
     --topk 100 \
     --condition_dim 768 \
     --num_decoder_queries 50 \
-    --sub_approach transformer_decoder 
+    --sub_approach linear_projection \
+    
+accelerate launch --config_file acc_config.yaml --num_processes 4 train_brain_adapter.py \
+    --learning_rate 0 \
+    --num_train_epochs 1 \
+    --train_batch_size 16 \
+    --dataloader_num_workers=8 \
+    --training_subjects 1 2 3 4 5 6 7 8 \
+    --topk 100 \
+    --condition_dim 768 \
+    --num_decoder_queries 50 \
+    --sub_approach linear_projection \
 
 # Full training run:
 accelerate launch --config_file acc_config.yaml train_brain_adapter.py \
     --learning_rate 1e-04 \
     --num_train_epochs 100 \
-    --train_batch_size 8 \
+    --train_batch_size 16 \
     --dataloader_num_workers=8 \
     --subject_id 1 \
-    --topk 50 \
-    --condition_dim 192 \
+    --topk 100 \
+    --condition_dim 768 \
     --num_decoder_queries 50 \
-    --sub_approach linear_projection \
+    --sub_approach transformer_decoder \
+    --wandb
+
+# Training with existing IP-Adapter weights:
+accelerate launch --config_file acc_config.yaml train_brain_adapter.py \
+    --pretrained_ip_adapter_path brain_adapter/ip_adapter/checkpoints/ip-adapter_sd15.bin \
+    --learning_rate 1e-04 \
+    --num_train_epochs 100 \
+    --train_batch_size 16 \
+    --dataloader_num_workers=8 \
+    --subject_id 1 \
+    --topk 100 \
+    --condition_dim 1280 \
+    --num_decoder_queries 50 \
+    --sub_approach transformer_decoder \
     --wandb
 
 # Training with transformer decoder:

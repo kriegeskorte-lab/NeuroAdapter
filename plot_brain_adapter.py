@@ -566,8 +566,8 @@ if __name__ == "__main__":
 
     # 2. Plot specific range of samples:
     python plot_brain_adapter.py \
-        --results_dir brain_adapter/decoded_stimuli/07_28_2025-01_26/epoch_70/subset \
-        --start_idx 0 --end_idx 16
+        --results_dir brain_adapter/decoded_stimuli/08_14_2025-00_21/epoch_200/subset \
+        --start_idx 0 --end_idx 8
     
     # 3. Plot only grid comparison:
     python plot_brain_adapter.py brain_adapter/decoded_stimuli/07_26_2025-22_29/epoch_100/subset \
@@ -584,6 +584,11 @@ if __name__ == "__main__":
     # 6. Plot maximum 20 samples:
     python plot_brain_adapter.py brain_adapter/decoded_stimuli/07_26_2025-22_29/epoch_100/subset \
         --max_samples 20
+        
+    # 7. Plot for multi-subject training
+    python plot_brain_adapter.py \
+        --results_dir brain_adapter/decoded_stimuli/08_10_2025-15_50/epoch_100/subset/8 \
+        --start_idx 0 --end_idx 8
     
     # Individual plot format:
     # - If candidates available: 1 x (N+1) layout with GT + all N candidates

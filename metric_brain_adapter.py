@@ -9,19 +9,13 @@ This script evaluates the quality of brain-decoded images using multiple metrics
 The evaluation uses two-way identification tasks to measure how well reconstructed
 images can be matched to their original counterparts based on feature similarity.
 
-REFACTORING IMPROVEMENTS:
-- Modular class-based design with MetricEvaluator for better organization
-- Separate functions for each metric type (pixel, AlexNet, Inception, etc.)
-- Comprehensive type hints and docstrings for better code documentation
-- Configuration class for centralized parameter management
-- Proper error handling and validation
-- Cleaner argument parsing and file path handling
-- Enhanced logging and progress reporting
-- Utility functions for data conversion and visualization
+Reference:
+- https://github.com/MedARC-AI/fMRI-reconstruction-NSD/blob/main/src/Reconstruction_Metrics.ipynb
 """
 
 import os
 import argparse
+from tqdm import tqdm
 from typing import Tuple, Dict, List, Optional
 from dataclasses import dataclass
 
@@ -29,8 +23,10 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torchvision import transforms
-from skimage.color import rgb2gray
 from torchvision.utils import make_grid
+
+from skimage.color import rgb2gray
+from skimage.metrics import structural_similarity as ssim
 from PIL import Image
 
 import pandas as pd
@@ -143,27 +139,37 @@ def compute_pixel_correlation(
 ) -> np.ndarray:
     """
     Compute pixel-wise Pearson correlation between original and reconstructed images.
+    Based on reference implementation from meshconv-decoding.
     
     Args:
-        original_images: Ground truth images [N, 3, H, W]
-        reconstructed_images: Generated images [N, 3, H, W]
+        original_images: Ground truth images [N, 3, H, W] in [0, 1]
+        reconstructed_images: Generated images [N, 3, H, W] in [0, 1]
         
     Returns:
         Array of correlation scores for each image pair
     """
-    # Flatten spatial dimensions
-    orig_flat = original_images.flatten(1).cpu()
-    recon_flat = reconstructed_images.flatten(1).cpu()
+    # Preprocess: resize to standard size (425x425 as in reference)
+    preprocess = transforms.Compose([
+        transforms.Resize(425, interpolation=transforms.InterpolationMode.BILINEAR),
+    ])
     
-    # Center the data (zero-mean)
-    orig_centered = orig_flat - orig_flat.mean(1, keepdim=True)
-    recon_centered = recon_flat - recon_flat.mean(1, keepdim=True)
+    # Apply preprocessing and flatten while keeping batch dimension
+    orig_processed = preprocess(original_images).reshape(len(original_images), -1).cpu()
+    recon_processed = preprocess(reconstructed_images).reshape(len(reconstructed_images), -1).cpu()
     
-    # Compute correlation
-    numerator = (orig_centered * recon_centered).sum(1)
-    denominator = orig_centered.norm(1) * recon_centered.norm(1) + MetricConfig.EPS
+    # Compute correlation for each image pair
+    correlations = []
+    for i in range(len(original_images)):
+        corr_matrix = np.corrcoef(orig_processed[i], recon_processed[i])
+        correlation = corr_matrix[0, 1]
+        
+        # Handle NaN cases (when std is 0)
+        if np.isnan(correlation):
+            correlation = 0.0
+            
+        correlations.append(correlation)
     
-    return (numerator / denominator).numpy()
+    return np.array(correlations)
 
 
 def compute_ssim_correlation(
@@ -171,31 +177,48 @@ def compute_ssim_correlation(
     reconstructed_images: torch.Tensor
 ) -> List[float]:
     """
-    Compute structural similarity using correlation on grayscale images.
+    Compute SSIM (Structural Similarity Index) between original and reconstructed images.
+    Based on reference implementation from meshconv-decoding.
     
     Args:
-        original_images: Ground truth images [N, 3, H, W]
-        reconstructed_images: Generated images [N, 3, H, W]
+        original_images: Ground truth images [N, 3, H, W] in [0, 1]
+        reconstructed_images: Generated images [N, 3, H, W] in [0, 1]
         
     Returns:
-        List of SSIM correlation scores for each image pair
+        List of SSIM scores for each image pair
     """
-    # Convert to numpy format [N, H, W, C] for skimage processing
-    orig_numpy = original_images.permute(0, 2, 3, 1).cpu().numpy()
-    recon_numpy = reconstructed_images.permute(0, 2, 3, 1).cpu().numpy()
     
+    # Preprocess: resize to standard size (425x425 as in reference)
+    preprocess = transforms.Compose([
+        transforms.Resize(425, interpolation=transforms.InterpolationMode.BILINEAR),
+    ])
+    
+    # Convert to format for rgb2gray: (N, H, W, C)
+    orig_processed = preprocess(original_images).permute(0, 2, 3, 1).cpu()
+    recon_processed = preprocess(reconstructed_images).permute(0, 2, 3, 1).cpu()
+    
+    # Convert to grayscale
+    img_gray = rgb2gray(orig_processed)
+    recon_gray = rgb2gray(recon_processed)
+    
+    print("Converted to grayscale, now calculating SSIM...")
+    
+    # Compute SSIM for each image pair
     ssim_scores = []
-    for orig_img, recon_img in zip(orig_numpy, recon_numpy):
-        # Convert to grayscale
-        orig_gray = rgb2gray(orig_img)
-        recon_gray = rgb2gray(recon_img)
-        
-        # Compute correlation between flattened grayscale images
-        correlation = sp.spatial.distance.correlation(
-            orig_gray.flatten(), 
-            recon_gray.flatten()
-        )
-        ssim_scores.append(correlation)
+    for orig_img, recon_img in zip(img_gray, recon_gray):
+        try:
+            ssim_score = ssim(
+                recon_img, orig_img,  # Note: recon first, orig second as in reference
+                multichannel=False,   # Grayscale images
+                gaussian_weights=True,
+                sigma=1.5,
+                use_sample_covariance=False,
+                data_range=1.0
+            )
+            ssim_scores.append(ssim_score)
+        except Exception as e:
+            print(f"Warning: SSIM computation failed: {e}")
+            ssim_scores.append(0.0)
     
     return ssim_scores
 
@@ -317,7 +340,7 @@ class MetricEvaluator:
         
         print(">>> Computing AlexNet features...")
         
-        # AlexNet layer 4
+        # AlexNet layer 2 -> features.4
         model, preprocessor = create_model_preprocessor(
             alexnet, AlexNet_Weights.IMAGENET1K_V1, ["features.4"],
             self.config.ALEX_SIZE, self.config.IMAGENET_MEAN, self.config.IMAGENET_STD, 
@@ -328,12 +351,12 @@ class MetricEvaluator:
             reconstructed_images, original_images, model, preprocessor,
             feature_layer="features.4", return_avg=False, device=self.device
         )
-        metrics["Alex(4)"] = pd.Series(scores / total_comparisons * 100, name="Alex(4)")
-        
+        metrics["Alex(2)"] = pd.Series(scores / total_comparisons * 100, name="Alex(2)")
+
         model.cpu()
         del model
-        
-        # AlexNet layer 11
+
+        # AlexNet layer 5 -> features.11
         model, preprocessor = create_model_preprocessor(
             alexnet, AlexNet_Weights.IMAGENET1K_V1, ["features.11"],
             self.config.ALEX_SIZE, self.config.IMAGENET_MEAN, self.config.IMAGENET_STD, 
@@ -344,8 +367,8 @@ class MetricEvaluator:
             reconstructed_images, original_images, model, preprocessor,
             feature_layer="features.11", return_avg=False, device=self.device
         )
-        metrics["Alex(11)"] = pd.Series(scores / total_comparisons * 100, name="Alex(11)")
-        
+        metrics["Alex(5)"] = pd.Series(scores / total_comparisons * 100, name="Alex(5)")
+
         model.cpu()
         del model
         
@@ -529,7 +552,7 @@ def load_and_validate_data(results_dir: str) -> Tuple[torch.Tensor, torch.Tensor
     original_images_list = []
     predicted_images_list = []
     
-    for dataset_idx in dataset_indices:
+    for dataset_idx in tqdm(dataset_indices):
         sample_filename = f"sample_{dataset_idx:06d}.npz"
         sample_path = os.path.join(results_dir, sample_filename)
         
@@ -623,7 +646,7 @@ def normalize_images(images: torch.Tensor) -> torch.Tensor:
         images = images.float()
 
     # Normalize images to [0, 1] range
-    images = images.clamp(0, 1)
+    images = (images - images.min()) / (images.max() - images.min())
 
     return images
 
@@ -666,8 +689,8 @@ def save_results(
         "metric_descriptions": {
             "PixCorr": "Pixel-wise Pearson correlation",
             "SSIM": "Structural Similarity Index correlation", 
-            "Alex(4)": "AlexNet layer 4 two-way identification accuracy (%)",
-            "Alex(11)": "AlexNet layer 11 two-way identification accuracy (%)",
+            "Alex(2)": "AlexNet layer 2 two-way identification accuracy (%)",
+            "Alex(5)": "AlexNet layer 5 two-way identification accuracy (%)",
             "Incep": "Inception-v3 avgpool two-way identification accuracy (%)",
             "CLIP": "CLIP ViT-L/14 two-way identification accuracy (%)",
             "Eff": "EfficientNet-B1 avgpool feature correlation",
@@ -746,13 +769,18 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
     # Construct results directory path
-    model_name = args.model_weights_dir.split("/")[-1]
-    results_dir = os.path.join(
-        args.decoded_stimuli_dir, 
-        model_name, 
-        f"epoch_{args.saved_epochs}", 
-        args.evaluation_mode
-    )
+    if args.results_dir is not None:
+        results_dir = args.results_dir
+        print(f"Using provided results directory: {results_dir}")
+    else:
+        model_name = args.model_weights_dir.split("/")[-1]
+        results_dir = os.path.join(
+            args.decoded_stimuli_dir, 
+            model_name, 
+            f"epoch_{args.saved_epochs}", 
+            args.evaluation_mode
+        )
+        print(f"Auto-constructed results directory: {results_dir}")
     
     print("=== Brain Adapter Metrics Evaluation ===")
     print(f"Model: {model_name}")
@@ -813,6 +841,12 @@ def create_argument_parser() -> argparse.ArgumentParser:
         help="Base directory containing decoded stimuli results"
     )
     parser.add_argument(
+        "--results_dir",
+        type=str,
+        default=None,
+        help="Direct path to results directory (overrides automatic path construction)"
+    )
+    parser.add_argument(
         "--saved_epochs",
         type=str,
         default="100", 
@@ -839,14 +873,14 @@ if __name__ == "__main__":
 
     # Evaluate subset results from epoch 100:
     python metric_brain_adapter.py \
-        --model_weights_dir brain_adapter/model_weights/07_26_2025-22_29 \
+        --model_weights_dir brain_adapter/decoded_stimuli/07_26_2025-22_29 \
         --saved_epochs 100 \
         --evaluation_mode subset
     
     # Evaluate full dataset results from epoch 200:
     python metric_brain_adapter.py \
-        --model_weights_dir brain_adapter/model_weights/07_26_2025-22_29 \
-        --saved_epochs 100 \
+        --model_weights_dir brain_adapter/model_weights/08_03_2025-17_39 \
+        --saved_epochs 200 \
         --evaluation_mode full
     
     # With custom directories and visualization:

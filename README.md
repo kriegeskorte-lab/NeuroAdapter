@@ -33,7 +33,7 @@ conda activate brain
 ```
 
 ### Preparation
-1. git clone whole_brain_encoder
+1. git clone from [whole_brain_encoder](https://github.com/kriegeskorte-lab/whole_brain_encoder)
 2. create a `__init__.py` in whole_brain_encoder
 3. replace `import xxx` with in `import whole_brain_encoder.xxx` in whole_brain_encoder
 4. create a folder called `checkpoints`
@@ -165,7 +165,7 @@ brain_adapter/
 
 ## 📄 License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+This project is licensed under the MIT License 
 <!-- 
 ## 🙏 Acknowledgments
 
