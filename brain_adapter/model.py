@@ -129,6 +129,12 @@ class GuidanceGenerator(nn.Module):
             condition_tokens: [B, num_decoder_queries, output_dim]
             fmri_tokens: [B, num_parcels, output_dim]
         """
+        # B, num_parcels, max_voxels = fmri_data.shape
+        # hidden_dim = 768
+        # pad_size = hidden_dim - max_voxels
+        # fmri_tokens = F.pad(fmri_data, (0, pad_size), "constant", 0)
+        # return fmri_tokens, None
+    
         fmri_tokens = self.parcel_mapper(fmri_data)
         # print(torch.isnan(self.parcel_mapper.linear_weights).any(), 'NaNs in weights')
         # print(torch.isnan(self.parcel_mapper.linear_bias).any(), 'NaNs in bias')

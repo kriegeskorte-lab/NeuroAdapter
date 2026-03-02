@@ -94,6 +94,12 @@ def compute_two_way_identification(
         If return_avg=True: (average_accuracy, total_comparisons)
         If return_avg=False: (per_image_scores, total_comparisons)
     """
+    # Ensure all images are in [0, 1] range before preprocessing
+    if reconstructed_images.max() > 1.0:
+        reconstructed_images = reconstructed_images / 255.0
+    if original_images.max() > 1.0:
+        original_images = original_images / 255.0
+        
     # Stack and preprocess images
     recons = torch.stack([preprocess(img) for img in reconstructed_images]).to(device)
     originals = torch.stack([preprocess(img) for img in original_images]).to(device)
@@ -120,15 +126,25 @@ def compute_two_way_identification(
     
     # Get diagonal elements (correct matches)
     correct_match_correlations = np.diag(cross_correlations)
-
-    # Count how many incorrect matches have lower correlation than correct match
-    # This gives us the "identification success" for each image
-    success_counts = (cross_correlations < correct_match_correlations[:, None]).sum(axis=0)
     
-    total_comparisons = n_images - 1  # Exclude self-comparison
+    # For each original image, count how many reconstructed images have lower correlation with it
+    # than the correct match (excluding the correct match itself)
+    success_counts = np.zeros(n_images)
+    for i in range(n_images):
+        # Get correlations between this original and all reconstructions
+        corrs = cross_correlations[i, :]
+        # Correct match correlation
+        correct_corr = corrs[i]
+        # Count reconstructions with lower correlation (= successful identification)
+        # We're counting entries where corr < correct_corr, so we want correct_corr to be high
+        success_counts[i] = (corrs < correct_corr).sum()
+    
+    # Normalize by total comparisons (n_images - 1 for each image)
+    total_comparisons = n_images - 1
     
     if return_avg:
-        return success_counts.mean() / total_comparisons
+        avg_success = success_counts.mean() / total_comparisons if total_comparisons > 0 else 0
+        return avg_success
     else:
         return success_counts, total_comparisons
 
@@ -252,8 +268,11 @@ def create_model_preprocessor(
         return_nodes=return_nodes
     ).to(device).eval().requires_grad_(False)
     
+    # Include ToPILImage to ensure proper image format and resizing
     preprocessor = transforms.Compose([
+        transforms.ToPILImage(),
         transforms.Resize(input_size, interpolation=transforms.InterpolationMode.BILINEAR),
+        transforms.ToTensor(),
         transforms.Normalize(mean=mean, std=std)
     ])
     
@@ -347,11 +366,13 @@ class MetricEvaluator:
             self.device
         )
         
-        scores, total_comparisons = compute_two_way_identification(
+        # Use proper cross-correlation calculation as in the reference implementation
+        scores = compute_two_way_identification(
             reconstructed_images, original_images, model, preprocessor,
             feature_layer="features.4", return_avg=False, device=self.device
         )
-        metrics["Alex(2)"] = pd.Series(scores / total_comparisons * 100, name="Alex(2)")
+        # Scale to percentages and create series
+        metrics["Alex(2)"] = pd.Series(scores[0] / scores[1] * 100, name="Alex(2)")
 
         model.cpu()
         del model
@@ -363,11 +384,13 @@ class MetricEvaluator:
             self.device
         )
         
-        scores, total_comparisons = compute_two_way_identification(
+        # Use proper cross-correlation calculation as in the reference implementation
+        scores = compute_two_way_identification(
             reconstructed_images, original_images, model, preprocessor,
             feature_layer="features.11", return_avg=False, device=self.device
         )
-        metrics["Alex(5)"] = pd.Series(scores / total_comparisons * 100, name="Alex(5)")
+        # Scale to percentages and create series
+        metrics["Alex(5)"] = pd.Series(scores[0] / scores[1] * 100, name="Alex(5)")
 
         model.cpu()
         del model
@@ -388,7 +411,8 @@ class MetricEvaluator:
             self.device
         )
         
-        scores, total_comparisons = compute_two_way_identification(
+        # Use proper cross-correlation calculation as in the reference implementation
+        scores = compute_two_way_identification(
             reconstructed_images, original_images, model, preprocessor,
             feature_layer="avgpool", return_avg=False, device=self.device
         )
@@ -396,7 +420,8 @@ class MetricEvaluator:
         model.cpu()
         del model
         
-        return {"Incep": pd.Series(scores / total_comparisons * 100, name="Incep")}
+        # Scale to percentages and create series
+        return {"Incep": pd.Series(scores[0] / scores[1] * 100, name="Incep")}
     
     def compute_clip_metrics(
         self, 
@@ -613,9 +638,6 @@ def load_and_validate_data(results_dir: str) -> Tuple[torch.Tensor, torch.Tensor
     if original_images.shape != predicted_images.shape:
         predicted_images = resize_images(predicted_images, original_images.shape[2:])
 
-    original_images = normalize_images(original_images)
-    predicted_images = normalize_images(predicted_images)
-
     return original_images, predicted_images
 
 def resize_images(
@@ -630,25 +652,6 @@ def resize_images(
         Resized image tensor
     """
     return torch.nn.functional.interpolate(images, size=target_size, mode="bilinear", align_corners=False)
-
-def normalize_images(images: torch.Tensor) -> torch.Tensor:
-    """
-    Normalize images to [0, 1] range.
-
-    Args:
-        images: Input image tensor
-
-    Returns:
-        Processed image tensor
-    """
-    # Ensure images are in float format
-    if images.dtype != torch.float32:
-        images = images.float()
-
-    # Normalize images to [0, 1] range
-    images = (images - images.min()) / (images.max() - images.min())
-
-    return images
 
 
 def save_results(
@@ -703,10 +706,6 @@ def save_results(
         json.dump(results_data, f, indent=2)
     
     print(f"\nResults saved to: {output_path}")
-    print(f"Summary statistics:")
-    for metric, stats in summary_stats.items():
-        print(f"  {metric}: {stats['mean']:.4f} ± {stats['std']:.4f}")
-
 
 def convert_to_uint8(images: torch.Tensor) -> torch.Tensor:
     """
@@ -772,6 +771,7 @@ def main():
     if args.results_dir is not None:
         results_dir = args.results_dir
         print(f"Using provided results directory: {results_dir}")
+        model_name = args.results_dir.split("/")[-3]
     else:
         model_name = args.model_weights_dir.split("/")[-1]
         results_dir = os.path.join(
@@ -855,9 +855,9 @@ def create_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--evaluation_mode",
         type=str,
-        choices=["subset", "full"],
+        choices=["subset", "full", "illusion"],
         default="subset",
-        help="Evaluation mode: 'subset' or 'full' dataset"
+        help="Evaluation mode: 'subset', 'full', or 'illusion' dataset"
     )
     parser.add_argument(
         "--create_visualization",
@@ -873,13 +873,13 @@ if __name__ == "__main__":
 
     # Evaluate subset results from epoch 100:
     python metric_brain_adapter.py \
-        --model_weights_dir brain_adapter/decoded_stimuli/07_26_2025-22_29 \
-        --saved_epochs 100 \
-        --evaluation_mode subset
+        --model_weights_dir brain_adapter/decoded_stimuli/09_25_2025-14_54 \
+        --saved_epochs 500 \
+        --evaluation_mode illusion
     
     # Evaluate full dataset results from epoch 200:
     python metric_brain_adapter.py \
-        --model_weights_dir brain_adapter/model_weights/08_03_2025-17_39 \
+        --model_weights_dir brain_adapter/model_weights/08_16_2025-18_03 \
         --saved_epochs 200 \
         --evaluation_mode full
     

@@ -320,7 +320,7 @@ class nsd_topk_parcel_dataset(Dataset):
         self.transform = transform
         topk = abs(topk)
         self.num_parcels = topk * 2
-        print(f"Training on subject: {args.subj}")
+        print(f"{split.capitalize()}ing on subject: {args.subj}")
         # print(f"choosing {topk} parcels per hemisphere for training")
 
         self.selected_parcel_idx = selected_parcel_idx.copy()
@@ -349,13 +349,11 @@ class nsd_topk_parcel_dataset(Dataset):
             
         self.tokenizer = args.tokenizer
         self.gen_size = args.gen_size
-        self.ipadapter_transform = transforms.Compose(
-            [
-                transforms.ToTensor(),
-                transforms.Resize(self.gen_size),
-                transforms.Normalize([0.5], [0.5]),
-            ]
-        )
+        self.ipadapter_transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Resize(self.gen_size),
+            transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]), #[-1, 1]
+        ])
     
     def metadata(self, subj):
         neural_data_path = Path(self.args.data_dir)
@@ -468,282 +466,6 @@ class nsd_topk_parcel_dataset(Dataset):
             "brain_rh_f": rh_, # shape: [200, max_voxels]
         }
         
-class nsd_groupwise_topk_parcel_dataset(Dataset):
-    def __init__(self, args, split, transform=None, topk=100, train_subj=list(range(1, 9)), test_subj=None):
-        """
-        Group-wise parcel selection dataset that aggregates mean SNR ranks across all subjects.
-        
-        Args:
-            args: arguments containing data paths and configuration
-            split: 'train', 'val', or 'test'
-            transform: image transform
-            topk: number of top parcels to select based on mean rank across subjects
-            test_subj: subject ID for test/val splits (1-8), ignored for train split
-        """
-        assert topk > 0, "topk must be positive"
-        
-        self.args = args
-        self.transform = transform
-        self.split = split
-        self.topk = abs(topk)
-        self.num_parcels = topk * 2  # topk per hemisphere
-        
-        # For train: use all subjects, for test/val: use specified subject
-        if split == 'train':
-            self.subjects = train_subj  # subjects 1-8
-            print(f"Training mode: using subjects {self.subjects}")
-        else:
-            assert test_subj is not None and 1 <= test_subj <= 8, "test_subj must be between 1-8 for test/val splits"
-            self.subjects = [test_subj]
-            print(f"{split.capitalize()} mode: using subject {test_subj}")
-        
-        # Step 1: Aggregate SNR ranks across all subjects (1-8) for parcel selection
-        self.selected_parcel_idx = self._select_parcels_groupwise()
-
-        # Step 2: Load data for the specified subjects
-        self.base_datasets = {}
-        self.parcels = {}
-        self.max_voxels = 0
-
-        for subj in self.subjects:
-            # Create args for this subject
-            subj_args = SimpleNamespace(**vars(args))
-            subj_args.subj = subj
-            
-            # Load base dataset
-            self.base_datasets[subj] = nsd_dataset_avg(subj_args, transform=None, split=split)
-            
-            # Load parcels for this subject
-            self.parcels[subj] = {}
-            for hemi in ["lh", "rh"]:
-                self.parcels[subj][hemi] = self.base_datasets[subj].parcels[hemi][1:]  # skip medial wall
-                
-                # Update max_voxels based on selected parcels
-                for parcel_idx in self.selected_parcel_idx[hemi]:
-                    if parcel_idx < len(self.parcels[subj][hemi]):
-                        voxel_count = len(self.parcels[subj][hemi][parcel_idx])
-                        self.max_voxels = max(self.max_voxels, voxel_count)
-        
-        # Setup tokenizer and transforms
-        self.tokenizer = args.tokenizer
-        self.gen_size = args.gen_size
-        self.ipadapter_transform = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Resize(self.gen_size),
-            transforms.Normalize([0.5], [0.5]),
-        ])
-        
-        # Create index mapping for samples
-        self._create_sample_indices()
-    
-    def _select_parcels_groupwise(self):
-        """Select parcels based on mean SNR rank across all subjects (1-8)"""
-        parcel_ranks = {"lh": [], "rh": []}
-        
-        # Get SNR data for all subjects
-        all_subject_snr = {}
-        max_parcels = {"lh": 0, "rh": 0}
-        
-        for subj in range(1, 9):  # Always use all subjects for parcel selection
-            subj_meta = self._load_metadata(subj)
-            
-            # Load parcels for this subject
-            parcel_path = Path(self.args.parcel_dir)
-            subj_parcels = {}
-            for hemi in ["lh", "rh"]:
-                subj_parcels[hemi] = torch.load(
-                    parcel_path / f"{hemi}_labels_s{subj:02}.pt", weights_only=True
-                )[1:]  # skip medial wall
-                max_parcels[hemi] = max(max_parcels[hemi], len(subj_parcels[hemi]))
-            
-            all_subject_snr[subj] = {"parcels": subj_parcels, "meta": subj_meta}
-        
-        # Calculate ranks for each hemisphere
-        selected_idx = {}
-        for hemi in ["lh", "rh"]:
-            # Create rank matrix: subjects x parcels
-            rank_matrix = []
-            
-            for subj in range(1, 9):
-                nc = all_subject_snr[subj]["meta"][f"{hemi}_ncsnr"].squeeze()
-                parcels = all_subject_snr[subj]["parcels"][hemi]
-                
-                # Calculate mean SNR per parcel
-                mean_snr = []
-                for voxel_idx in parcels:
-                    mean_snr.append(nc[voxel_idx].mean())
-                
-                # Convert to ranks (lower rank = better SNR)
-                ranks = np.argsort(np.argsort(mean_snr)[::-1])
-                rank_matrix.append(ranks)
-            
-            rank_matrix = np.stack(rank_matrix)  # shape: [8, num_parcels]
-            mean_ranks = rank_matrix.mean(axis=0)
-            
-            # Select top parcels based on mean rank
-            valid_parcels = ~np.isnan(mean_ranks)
-            valid_mean_ranks = mean_ranks[valid_parcels]
-            valid_indices = np.where(valid_parcels)[0]
-            
-            sorted_indices = valid_indices[np.argsort(valid_mean_ranks)]
-            selected_idx[hemi] = sorted_indices[:self.topk]
-        
-        return selected_idx
-    
-    def _load_metadata(self, subj):
-        """Load metadata for a specific subject"""
-        neural_data_path = Path(self.args.data_dir)
-        return np.load(
-            neural_data_path / f"metadata_sub-{subj:02}.npy", allow_pickle=True
-        ).item()
-    
-    def _create_sample_indices(self):
-        """Create mapping from dataset index to (subject, sample_idx)"""
-        self.sample_mapping = []
-        
-        for subj in self.subjects:
-            dataset_len = len(self.base_datasets[subj])
-            for sample_idx in range(dataset_len):
-                self.sample_mapping.append((subj, sample_idx))
-                
-    def get_selected_voxel_indices(self, subj=None):
-        """
-        Get voxel indices for each selected parcel.
-        
-        Args:
-            subj: Subject ID (1-8). If None, returns voxel indices for the first subject in self.subjects
-        
-        Returns:
-            dict: Dictionary with 'lh' and 'rh' keys, each containing a list of tensor arrays
-                  with voxel indices for each selected parcel
-        """
-        if subj is None:
-            subj = self.subjects[0]
-        
-        assert subj in self.subjects, f"Subject {subj} not in available subjects: {self.subjects}"
-        
-        voxel_indices = {"lh": [], "rh": []}
-        
-        for hemi in ["lh", "rh"]:
-            for parcel_idx in self.selected_parcel_idx[hemi]:
-                if parcel_idx < len(self.parcels[subj][hemi]):
-                    voxel_idxs = self.parcels[subj][hemi][parcel_idx]
-                    voxel_indices[hemi].append(voxel_idxs)
-                else:
-                    # If this subject doesn't have this parcel, return empty tensor
-                    voxel_indices[hemi].append(torch.tensor([], dtype=torch.long))
-        
-        return voxel_indices
-    
-    def get_selected_parcel_info(self, subj=None):
-        """
-        Get detailed information about selected parcels for a specific subject.
-        
-        Args:
-            subj: Subject ID (1-8). If None, uses the first subject in self.subjects
-        
-        Returns:
-            dict: Dictionary containing parcel information including indices, sizes, and voxel counts
-        """
-        if subj is None:
-            subj = self.subjects[0]
-            
-        assert subj in self.subjects, f"Subject {subj} not in available subjects: {self.subjects}"
-        
-        info = {
-            "subject": subj,
-            "lh": {
-                "parcel_indices": self.selected_parcel_idx["lh"].tolist() if hasattr(self.selected_parcel_idx["lh"], 'tolist') else list(self.selected_parcel_idx["lh"]),
-                "voxel_counts": [],
-                "total_voxels": 0
-            },
-            "rh": {
-                "parcel_indices": self.selected_parcel_idx["rh"].tolist() if hasattr(self.selected_parcel_idx["rh"], 'tolist') else list(self.selected_parcel_idx["rh"]),
-                "voxel_counts": [],
-                "total_voxels": 0
-            }
-        }
-        
-        for hemi in ["lh", "rh"]:
-            for parcel_idx in self.selected_parcel_idx[hemi]:
-                if parcel_idx < len(self.parcels[subj][hemi]):
-                    voxel_count = len(self.parcels[subj][hemi][parcel_idx])
-                else:
-                    voxel_count = 0
-                info[hemi]["voxel_counts"].append(voxel_count)
-                info[hemi]["total_voxels"] += voxel_count
-        
-        info["max_voxels_per_parcel"] = self.max_voxels
-        info["total_parcels"] = len(self.selected_parcel_idx["lh"]) + len(self.selected_parcel_idx["rh"])
-        
-        return info
-    
-    def extract_and_pad(self, fmri_data, hemi, subj):
-        """Extract and pad fMRI data for selected parcels"""
-        out = []
-        dtype = fmri_data.dtype
-        for parcel_idx in self.selected_parcel_idx[hemi]:
-            if parcel_idx < len(self.parcels[subj][hemi]):
-                voxel_idxs = self.parcels[subj][hemi][parcel_idx]
-                roi = fmri_data[voxel_idxs]
-            else:
-                # If this subject doesn't have this parcel, use zeros
-                roi = torch.zeros((1,), dtype=dtype)
-
-            if roi.shape[0] < self.max_voxels:
-                pad = torch.zeros(self.max_voxels - roi.shape[0], dtype=dtype)
-                roi = torch.cat([roi, pad])
-            else:
-                roi = roi[:self.max_voxels]
-            out.append(roi)
-        
-        return torch.stack(out)
-    
-    def __len__(self):
-        return len(self.sample_mapping)
-    
-    def __getitem__(self, idx):
-        subj, sample_idx = self.sample_mapping[idx]
-        
-        # Get data from the appropriate subject's dataset
-        img, fmri_data = self.base_datasets[subj][sample_idx]
-        
-        # Split brain data by hemisphere
-        lh_fmri = fmri_data["betas"][:163842]
-        rh_fmri = fmri_data["betas"][163842:]
-        
-        # Extract and pad selected parcels
-        lh_ = self.extract_and_pad(lh_fmri, hemi="lh", subj=subj)
-        rh_ = self.extract_and_pad(rh_fmri, hemi="rh", subj=subj)
-        
-        # Process image
-        img_ipadapter = self.ipadapter_transform(img)
-        if self.transform:
-            img = self.transform(img)
-        else:
-            img = transforms.ToTensor()(img)
-        
-        # Process text (empty for now)
-        text = ""
-        if self.tokenizer is None:
-            text_input_ids = torch.zeros(1, dtype=torch.long)
-        else:
-            text_input_ids = self.tokenizer(
-                text,
-                max_length=self.tokenizer.model_max_length,
-                padding="max_length",
-                truncation=True,
-            return_tensors="pt",
-        ).input_ids
-        
-        return {
-            "img_encoder": img,
-            "img_ipadapter": img_ipadapter,
-            "text_input_ids": text_input_ids,
-            "brain_lh_f": lh_,  # shape: [topk, max_voxels]
-            "brain_rh_f": rh_,  # shape: [topk, max_voxels]
-        }
-        
 def get_dominant_roi_per_parcel(dataset, metadata, all_roi_names, min_overlap_threshold=0.1):
     """
     Matrix-based computation for maximum speed.
@@ -774,7 +496,7 @@ def get_dominant_roi_per_parcel(dataset, metadata, all_roi_names, min_overlap_th
         
         print(f"Processing {len(schaefer_voxel_indices[hemi])} {hemi.upper()} parcels with matrix operations...")
         
-        for parcel_idx, voxel_idxs in enumerate(tqdm(schaefer_voxel_indices[hemi], desc=f"{hemi.upper()}")):
+        for parcel_idx_following_topsnr_order, voxel_idxs in enumerate(tqdm(schaefer_voxel_indices[hemi], desc=f"{hemi.upper()}")):
             # Create parcel mask
             parcel_mask = np.zeros(hemi_size, dtype=bool)
             parcel_mask[voxel_idxs.numpy()] = True
@@ -797,10 +519,76 @@ def get_dominant_roi_per_parcel(dataset, metadata, all_roi_names, min_overlap_th
                 best_roi = None
                 best_overlap = 0
             
-            parcel_original_idx = dataset.selected_parcel_idx[hemi][parcel_idx]
-            dominant_rois[hemi].append((parcel_original_idx, best_roi, best_overlap, len(voxel_idxs)))
+            parcel_idx_200 = dataset.selected_parcel_idx[hemi][parcel_idx_following_topsnr_order]
+            dominant_rois[hemi].append((parcel_idx_200, best_roi, best_overlap, len(voxel_idxs)))
     
     return dominant_rois
+
+class illusion_dataset:
+    def __init__(self, img_dir="/engram/nklab/fc2803/IllusionReconstruction/data/test_image/", transform=None):
+        self.img_dir = Path(img_dir)
+        self.transform = transform if transform is not None else transforms.ToTensor()
+        self.img_paths = sorted(list(self.img_dir.glob("*.tif")))
+
+    def __len__(self):
+        return len(self.img_paths)
+
+    def __getitem__(self, idx):
+        img_path = self.img_paths[idx]
+        img = Image.open(img_path).convert("RGB")
+
+        img = self.transform(img)         # Tensor [3,H,W] float32 in [0,1]
+
+        return {
+            "img": img,
+            "img_path": str(img_path),
+        }
+    
+class imagenet_subset:
+    def __init__(self, img_dir="/engram/nklab/pf2477/ssl_foveation_learning/images/imagenet_sample_images/", transform=None):
+        self.img_dir = Path(img_dir)
+        self.transform = transform 
+        if transform is None:
+            self.transform = transforms.Compose([
+                transforms.Resize(512),
+                transforms.CenterCrop(512),
+                transforms.ToTensor(),
+            ])
+        
+        self.class_mapping = {
+            "mammals":         [12, 85, 102, 333, 417],
+            "birds":           [21, 49, 57, 284, 510],
+            "reptiles":        [5, 16, 350, 351, 352],
+            "aquatic":         [7, 71, 500, 501, 502],
+            "insects":         [9, 200, 201, 202, 203],
+            "domestic":        [25, 26, 27, 30, 31],
+            "vehicles":        [100, 101, 120, 121, 122],
+            "tools":           [600, 601, 602, 603, 604],
+            "clothing":        [700, 701, 702, 703, 704],
+            "structures":      [800, 801, 802, 803, 804],
+        }
+
+        self.img_paths_all = sorted(list(self.img_dir.glob("*.JPEG")))
+        self.img_paths = []
+        for class_name, class_indices in self.class_mapping.items():
+            for class_idx in class_indices:
+                self.img_paths.append(self.img_paths_all[class_idx])
+
+
+    def __len__(self):
+        return len(self.img_paths)
+
+    def __getitem__(self, idx):
+        img_path = self.img_paths[idx]
+        img = Image.open(img_path).convert("RGB")
+
+        img = self.transform(img)         # Tensor [3,H,W] float32 in [0,1]
+
+        return {
+            "img": img,
+            "img_path": str(img_path),
+        }
+    
         
 if __name__ == "__main__":
     import argparse
@@ -877,20 +665,80 @@ if __name__ == "__main__":
     print(len(metadata['lh_rois'][roi]))
     # print([id for id, val in enumerate(metadata['lh_rois'][roi]) if val == True])
     
-    dominant_rois = get_dominant_roi_per_parcel(train_dataset, metadata, all_roi_names, min_overlap_threshold=0.5)
-    
+    min_overlap_threshold=0.5
+    dominant_rois = get_dominant_roi_per_parcel(train_dataset, metadata, all_roi_names, min_overlap_threshold=min_overlap_threshold)
+
     print("\n" + "="*50)
-    print("DOMINANT ROI PER PARCEL (>10% overlap)")
+    print(f"DOMINANT ROI PER PARCEL (>{min_overlap_threshold*100:.0f}% overlap)")
     print("="*50)
     
+
+    roi_groups = {
+        # Early / retinotopic visual
+        "V1": ["V1v", "V1d"],
+        "V2": ["V2v", "V2d"],
+        "V3": ["V3v", "V3d"],
+        "V4": ["hV4"],
+
+        # Higher-level ventral stream
+        "Face": ["OFA", "FFA-1", "FFA-2"],
+        "Body": ["EBA", "FBA-1", "FBA-2"],
+        "Scene": ["PPA", "OPA", "RSC"],
+        "Word": ["VWFA-1", "VWFA-2", "OWFA", "mfs-words"],
+    }
+
+    roi_parcel_id = {
+        'lh': {
+            "V1": [],
+            "V2": [],
+            "V3": [],
+            "V4": [],
+            "Face": [],
+            "Body": [],
+            "Scene": [],
+            "Word": [],
+        },
+        'rh': {
+            "V1": [],
+            "V2": [],
+            "V3": [],
+            "V4": [],
+            "Face": [],
+            "Body": [],
+            "Scene": [],
+            "Word": [],
+        },
+    }
     for hemi in ['lh', 'rh']:
         print(f"\n{hemi.upper()} Hemisphere:")
         cnt = 0
-        for parcel_idx, roi_name, overlap, num_voxels in dominant_rois[hemi]:
+        for parcel_idx, (parcel_original_idx, roi_name, overlap, num_voxels) in enumerate(dominant_rois[hemi]):
             if roi_name:
-                print(f"Parcel {parcel_idx:3d}: {roi_name:20s} ({overlap:.1%}) in {num_voxels} Schaefer voxels")
+                # print(f"Parcel {parcel_idx:3d}: {roi_name:20s} ({overlap:.1%}) in {num_voxels} Schaefer voxels")
                 cnt += 1
                 
+            if roi_name in roi_groups["V1"] + roi_groups["V4"] + roi_groups["V2"] + roi_groups["V3"]:
+                print(f"Parcel {parcel_original_idx:3d}: {roi_name:20s} ({overlap:.1%}) in {num_voxels} Schaefer voxels")
+            
+            if roi_name in roi_groups["V1"]:
+                roi_parcel_id[hemi]["V1"].append(parcel_idx)
+            elif roi_name in roi_groups["V2"]:
+                roi_parcel_id[hemi]["V2"].append(parcel_idx)
+            elif roi_name in roi_groups["V3"]:
+                roi_parcel_id[hemi]["V3"].append(parcel_idx)
+            elif roi_name in roi_groups["V4"]:
+                roi_parcel_id[hemi]["V4"].append(parcel_idx)
+            elif roi_name in roi_groups["Face"]:
+                roi_parcel_id[hemi]["Face"].append(parcel_idx)
+            elif roi_name in roi_groups["Body"]:
+                roi_parcel_id[hemi]["Body"].append(parcel_idx)
+            elif roi_name in roi_groups["Scene"]:
+                roi_parcel_id[hemi]["Scene"].append(parcel_idx)
+            elif roi_name in roi_groups["Word"]:
+                roi_parcel_id[hemi]["Word"].append(parcel_idx)
+
         print(f"Total parcels with dominant ROI in {hemi.upper()}: {cnt}")
             # else:
             #     print(f"Parcel {parcel_idx:3d}: No dominant ROI")
+
+    print(roi_parcel_id)

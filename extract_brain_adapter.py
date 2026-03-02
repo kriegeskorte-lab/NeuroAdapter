@@ -21,6 +21,7 @@ import warnings
 # Third-party imports
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch import nn
 from tqdm import tqdm
 from torchvision import transforms
@@ -71,28 +72,31 @@ class NeuroAdapter(torch.nn.Module):
         self._register_block_hook()
         
     def _register_block_hook(self):
-        """Register hooks to capture cross-attention maps from specific U-Net layers."""
+        """Register hooks to capture cross-attention maps from all IP-Adapter layers."""
         def hook_fn(name):
             def forward_hook(module, input, output):
                 if self.extract_attention and hasattr(module.processor, 'ip_attn_map'):
-                    # Store attention weights from IP-Adapter processor directly by layer name
-                    if hasattr(module.processor, 'ip_attn_map') and module.processor.ip_attn_map is not None:
-                        self.cross_attn_maps[name] = {
-                            'ip_attn_map': module.processor.ip_attn_map.clone().cpu()
-                        }
+                    # Store IP-Adapter attention weights with minimal memory footprint
+                    if module.processor.ip_attn_map is not None:
+                        # Store only the essential attention map data
+                        attn_map = module.processor.ip_attn_map.detach().cpu()
+                        if attn_map.shape[0] == 2:
+                            attn_map = attn_map[1] # Select the conditional attention map
+                        self.cross_attn_maps[name] = attn_map
+                        # Clear the processor's attention map to save memory
+                        module.processor.ip_attn_map = None
             return forward_hook
 
-        # Target key cross-attention layers for attention map extraction
-        target_layers = [
-            "down_blocks.0.attentions.0.transformer_blocks.0.attn2",
-            "mid_block.attentions.0.transformer_blocks.0.attn2",
-            "up_blocks.3.attentions.2.transformer_blocks.0.attn2",
-        ]
-        
+        # Register hooks for all cross-attention layers with IP-Adapter processors
+        self.layer_names = []
         for name, module in self.unet.named_modules():
-            if name in target_layers:
+            # Check if module has processor attribute and if it's an IP-Adapter processor
+            if hasattr(module, 'processor') and isinstance(module.processor, IPAttnProcessor):
                 handle = module.register_forward_hook(hook_fn(name))
+                self.layer_names.append(name)
                 print(f"Registered attention hook for: {name}")
+        
+        print(f"Total IP-Adapter layers registered: {len(self.layer_names)}")
     
     def clear_attention_maps(self):
         """Clear stored attention maps to free memory."""
@@ -307,18 +311,32 @@ def create_dataset(args, tokenizer):
     total_samples = len(dataset)
     print(f"Dataset created with {total_samples} total samples, using top {args.topk} parcels per hemisphere.")
     
-    # Determine evaluation indices
-    end_idx = min(args.end_idx, total_samples)
-    if args.start_idx >= total_samples:
-        raise ValueError(f"start_idx ({args.start_idx}) exceeds dataset size ({total_samples})")
-    if args.start_idx >= end_idx:
-        raise ValueError(f"start_idx ({args.start_idx}) must be less than end_idx ({end_idx})")
-        
-    indices = list(range(args.start_idx, end_idx))
+    # Determine evaluation indices based on selected_idx or start_idx/end_idx
+    if args.selected_idx is not None:
+        # Use specific indices provided by user
+        indices = args.selected_idx
+        # Validate that all selected indices are within dataset bounds
+        invalid_indices = [idx for idx in indices if idx >= total_samples or idx < 0]
+        if invalid_indices:
+            raise ValueError(f"Invalid indices {invalid_indices}: must be between 0 and {total_samples-1}")
+        print(f"Using selected indices: {indices}")
+    else:
+        # Use range-based selection (original behavior)
+        end_idx = min(args.end_idx, total_samples)
+        if args.start_idx >= total_samples:
+            raise ValueError(f"start_idx ({args.start_idx}) exceeds dataset size ({total_samples})")
+        if args.start_idx >= end_idx:
+            raise ValueError(f"start_idx ({args.start_idx}) must be less than end_idx ({end_idx})")
+            
+        indices = list(range(args.start_idx, end_idx))
+        print(f"Using range-based selection: indices {args.start_idx} to {end_idx-1}")
+    
+    # Apply max_samples limit if specified
     if args.max_samples is not None and len(indices) > args.max_samples:
         indices = indices[:args.max_samples]
+        print(f"Limited to first {args.max_samples} samples")
     
-    print(f"Processing {len(indices)} samples (indices {indices[0]} to {indices[-1]})")
+    print(f"Processing {len(indices)} samples: {indices}")
 
     # Create subset and dataloader (batch_size=1 for attention extraction)
     subset = torch.utils.data.Subset(dataset, indices)
@@ -337,7 +355,10 @@ def setup_device():
 def validate_arguments(args):
     """Validate and process command line arguments."""
     # Print extraction mode
-    print(f"Mode: Index-based attention extraction ({args.start_idx} to {args.end_idx})")
+    if args.selected_idx is not None:
+        print(f"Mode: Selected indices attention extraction {args.selected_idx}")
+    else:
+        print(f"Mode: Range-based attention extraction ({args.start_idx} to {args.end_idx})")
     if args.max_samples:
         print(f"  - Limited to first {args.max_samples} samples")
         
@@ -384,45 +405,49 @@ def freeze_models(*models):
             param.requires_grad = False
 
 
-def save_attention_maps(attention_maps, timestep_data, save_dir, sample_idx, timestep, layer_names):
+def save_attention_maps(attention_maps, timestep_data, save_dir, sample_idx, timestep, layer_names, save_images=False):
     """
-    Save attention maps and timestep images for a specific sample and timestep.
-    This function saves data for a single timestep to reduce memory usage.
+    Save attention maps and optionally timestep images for a specific sample and timestep.
+    This function is optimized for memory efficiency and storage compression.
     
     Args:
         attention_maps: Dictionary of attention maps by layer name (current timestep only)
-        timestep_data: Dictionary containing noisy and clean images for current timestep
+        timestep_data: Dictionary containing images for current timestep (optional)
         save_dir: Directory to save the attention data
         sample_idx: Sample index for filename
         timestep: Current timestep value
         layer_names: List of all layer names for reference
+        save_images: Whether to save decoded images (memory intensive)
     """
     # Create sample-specific directory
     sample_dir = os.path.join(save_dir, f"sample_{sample_idx:06d}")
     Path(sample_dir).mkdir(parents=True, exist_ok=True)
     
-    # Prepare data for this specific timestep
+    # Prepare data for this specific timestep with memory optimization
     timestep_save_data = {
-        'timestep': timestep,  # Single timestep value
+        'timestep': np.int32(timestep),  # Use smaller int type
         'attention_maps': {},
-        'stimulus': None,
-        'noisy_images': None,
-        'clean_predictions': None,
-        'layer_names': layer_names,
-        'sample_index': sample_idx
     }
     
-    # Process attention maps for this timestep
-    for layer_name, layer_data in attention_maps.items():
-        timestep_save_data['attention_maps'][layer_name] = layer_data['ip_attn_map'].numpy() if layer_data['ip_attn_map'] is not None else None
+    # Process attention maps for this timestep with compression
+    total_attn_size = 0
+    for layer_name, attn_map in attention_maps.items():
+        if attn_map is not None:
+            attn_array = attn_map.numpy().mean(axis=0, keepdims=True)
+
+            # Convert to float16 for storage efficiency (halves storage size)
+            attn_array = attn_array.astype(np.float16)
+            
+            timestep_save_data['attention_maps'][layer_name] = attn_array
+            total_attn_size += attn_array.nbytes
+        else:
+            timestep_save_data['attention_maps'][layer_name] = None
+
+    # Save estimated images
+    timestep_save_data['clean_predictions'] = timestep_data['clean_predictions']
     
-    # Save timestep images (both noisy and clean predictions)
-    if timestep_data is not None:
-        timestep_save_data['noisy_images'] = timestep_data['noisy_images']
-        timestep_save_data['clean_predictions'] = timestep_data['clean_predictions']
-    
-    # Save to individual timestep file
-    timestep_file = os.path.join(sample_dir, f"time_step_{int(timestep)}.npz")
+    # Save to individual timestep file with maximum compression
+    timestep_file = os.path.join(sample_dir, f"time_step_{int(timestep):03d}.npz")
     np.savez_compressed(timestep_file, **timestep_save_data)
     
     return timestep_file
@@ -439,7 +464,7 @@ def decode_latents_to_images(latents, vae, device):
     return temp_images
 
 
-def run_diffusion(brain_embeds, img_ip, models_dict, num_predictions=1, noise_factor=4.0, save_attention=False, attention_save_dir=None, sample_idx=None):
+def run_diffusion(brain_embeds, img_ip, models_dict, num_predictions=1, noise_factor=4.0, save_attention=False, attention_save_dir=None, sample_idx=None, save_freq=5):
     """
     Run diffusion process with brain conditioning to generate images.
     
@@ -452,6 +477,7 @@ def run_diffusion(brain_embeds, img_ip, models_dict, num_predictions=1, noise_fa
         save_attention: Whether to save attention maps
         attention_save_dir: Directory to save attention maps
         sample_idx: Sample index for naming attention files
+        save_freq: Save attention maps and images every N timesteps
         
     Returns:
         Generated images as numpy array
@@ -507,13 +533,6 @@ def run_diffusion(brain_embeds, img_ip, models_dict, num_predictions=1, noise_fa
         del noise
     latents = torch.cat(latents, dim=0)
 
-    # Collect layer names for saving (do this once before the loop)
-    target_layer_names = [
-        "down_blocks.0.attentions.0.transformer_blocks.0.attn2",
-        "mid_block.attentions.0.transformer_blocks.0.attn2",
-        "up_blocks.3.attentions.2.transformer_blocks.0.attn2",
-    ]
-
     # Diffusion denoising process
     diffusion_pbar = tqdm(timesteps, desc=f"Diffusion steps (sample {sample_idx})", leave=False, position=1)
     for i, t in enumerate(diffusion_pbar):
@@ -527,45 +546,49 @@ def run_diffusion(brain_embeds, img_ip, models_dict, num_predictions=1, noise_fa
         # Apply classifier-free guidance
         noise_pred = noise_pred_uncond + noise_factor * (noise_pred_cond - noise_pred_uncond)
         
-        # Clean up intermediate predictions
+        # Clean up intermediate predictions immediately
         del noise_pred_uncond, noise_pred_cond
         
         # Store and save timestep data immediately if saving attention
         if save_attention and attention_save_dir is not None:
-            # Store noisy latents (current state before denoising)
-            noisy_latents_decoded = decode_latents_to_images(latents.clone(), vae, device)
+            # Save attention maps based on frequency + ensure we capture start/end
+            save_this_timestep = (i % save_freq == 0) or (i < 5) or (i > len(timesteps) - 6)
             
-            # Get clean prediction using pred_original_sample
-            step_output = noise_scheduler.step(noise_pred, t, latents, return_dict=True)
-            pred_original_sample = step_output.pred_original_sample
-            clean_images_decoded = decode_latents_to_images(pred_original_sample.clone(), vae, device)
-            
-            # Create timestep data for immediate saving
-            current_timestep_data = {
-                'noisy_images': noisy_latents_decoded,  # Shows "snow→image" effect
-                'clean_predictions': clean_images_decoded  # Shows model's clean guess
-            }
-            
-            # Save attention maps and images immediately for this timestep
-            save_attention_maps(
-                brain_adapter.cross_attn_maps,  # Current timestep attention maps only
-                current_timestep_data,
-                attention_save_dir,
-                sample_idx,
-                t.item(),
-                target_layer_names
-            )
-            
-            latents = step_output.prev_sample
-            del noisy_latents_decoded, clean_images_decoded, step_output, pred_original_sample, current_timestep_data
+            if save_this_timestep:
+                # Get clean prediction using pred_original_sample (more memory efficient)
+                step_output = noise_scheduler.step(noise_pred, t, latents, return_dict=True)
+                
+                # Save both attention maps and images at the same frequency
+                pred_original_sample = step_output.pred_original_sample
+                clean_images_decoded = decode_latents_to_images(pred_original_sample.clone(), vae, device)
+                current_timestep_data = {'clean_predictions': clean_images_decoded}
+                del pred_original_sample, clean_images_decoded
+                
+                # Save attention maps and images together
+                save_attention_maps(
+                    brain_adapter.cross_attn_maps,  # Current timestep attention maps only
+                    current_timestep_data,
+                    attention_save_dir,
+                    sample_idx,
+                    t.item(),
+                    brain_adapter.layer_names,
+                    save_images=True  # Always save images when saving attention
+                )
+                
+                latents = step_output.prev_sample
+                del step_output, current_timestep_data
+            else:
+                latents = noise_scheduler.step(noise_pred, t, latents).prev_sample
         else:
             latents = noise_scheduler.step(noise_pred, t, latents).prev_sample
         
-        # Clean up noise prediction
+        # Clean up noise prediction and clear attention maps for next timestep
         del noise_pred
+        if save_attention:
+            brain_adapter.clear_attention_maps()
         
         # More frequent memory cleanup during diffusion
-        if (i + 1) % 10 == 0:
+        if (i + 1) % 5 == 0:
             torch.cuda.empty_cache()
 
     # Close the diffusion progress bar
@@ -601,9 +624,51 @@ def freeze_models(*models):
             param.requires_grad = False
 
 
-def extract_attention_maps(dataloader, models_dict, dataset, save_attention=True, attention_save_dir=None):
+def save_layer_info(layer_names, save_dir, sample_idx):
+    """
+    Save comprehensive layer information for reference.
+    
+    Args:
+        layer_names: List of all IP-Adapter layer names
+        save_dir: Directory to save the layer info
+        sample_idx: Sample index (used for first sample only)
+    """
+    if sample_idx == 0:  # Only save once for the first sample
+        layer_info = {
+            'total_layers': len(layer_names),
+            'layer_names': layer_names,
+            'layer_hierarchy': {},
+            'block_counts': {}
+        }
+        
+        # Analyze layer hierarchy
+        for i, name in enumerate(layer_names):
+            parts = name.split('.')
+            block_type = parts[0] if len(parts) > 0 else 'unknown'
+            
+            if block_type not in layer_info['block_counts']:
+                layer_info['block_counts'][block_type] = 0
+            layer_info['block_counts'][block_type] += 1
+            
+            layer_info['layer_hierarchy'][i] = {
+                'name': name,
+                'block_type': block_type,
+                'parts': parts
+            }
+        
+        # Save layer info
+        layer_info_file = os.path.join(save_dir, "layer_info.npz")
+        np.savez_compressed(layer_info_file, **layer_info)
+        
+        print(f"Layer info saved: {len(layer_names)} total IP-Adapter layers")
+        for block_type, count in layer_info['block_counts'].items():
+            print(f"  {block_type}: {count} layers")
+
+
+def extract_attention_maps(args, dataloader, models_dict, dataset, save_attention=True, attention_save_dir=None, save_freq=5):
     """
     Extract attention maps from brain signals during diffusion process.
+    Optimized for memory efficiency and comprehensive attention capture.
     
     Args:
         dataloader: DataLoader containing brain data
@@ -611,6 +676,7 @@ def extract_attention_maps(dataloader, models_dict, dataset, save_attention=True
         dataset: Dataset instance for parcel information
         save_attention: Whether to save attention maps during diffusion
         attention_save_dir: Directory to save attention maps
+        save_freq: Save attention maps and images every N timesteps
         
     Returns:
         List of dataset indices processed
@@ -620,15 +686,28 @@ def extract_attention_maps(dataloader, models_dict, dataset, save_attention=True
     device = models_dict['device']
     weight_dtype = models_dict['weight_dtype']
     guidance_generator = models_dict['guidance_generator']
+    brain_adapter = models_dict['brain_adapter']
+    
+    # Print attention extraction setup
+    if save_attention:
+        print(f"Attention extraction enabled:")
+        print(f"  - Tracking {len(brain_adapter.layer_names)} IP-Adapter layers")
+        print(f"  - Saving attention maps and images every {save_freq} timesteps + first/last few timesteps")
+        print(f"  - Using float16 compression for attention maps")
     
     with torch.no_grad():
-        for batch_idx, batch in enumerate(tqdm(dataloader, desc="Extracting attention maps")):
+        # Create progress bar for the main extraction loop
+        extraction_pbar = tqdm(dataloader, desc="Extracting attention maps", position=0)
+        
+        for batch_idx, batch in enumerate(extraction_pbar):
             # Get dataset index for this sample
             if hasattr(dataloader.dataset, 'indices'):
                 dataset_idx = dataloader.dataset.indices[batch_idx]
             else:
                 dataset_idx = batch_idx
             dataset_indices.append(dataset_idx)
+            
+            tqdm.write(f"\nProcessing sample {dataset_idx} ({batch_idx+1}/{len(dataloader)})")
             
             # Process brain data
             lh = batch["brain_lh_f"].to(device, dtype=weight_dtype)
@@ -648,24 +727,36 @@ def extract_attention_maps(dataloader, models_dict, dataset, save_attention=True
             brain_conditioning, _ = guidance_generator(brain_data)
             
             # Create zero-filled image as initialization (no image information)
-            # Use a dummy image tensor with the right shape for VAE encoding
             device = models_dict['device']
             weight_dtype = models_dict['weight_dtype']
-            dummy_img = torch.zeros((1, 3, 512, 512), device=device, dtype=weight_dtype)
+            # dummy_img = torch.zeros((1, 3, 512, 512), device=device, dtype=weight_dtype)
+            dummy_img = batch["img_ipadapter"].to(device, dtype=weight_dtype)
+            
+            # Save layer information (only for first sample)
+            if save_attention and attention_save_dir:
+                save_layer_info(brain_adapter.layer_names, attention_save_dir, dataset_idx)
             
             # Run single diffusion pass to extract attention
-            run_diffusion(
-                brain_conditioning, dummy_img, models_dict,
-                num_predictions=1,  # Only need one pass for attention
-                noise_factor=4.0,
-                save_attention=save_attention,
-                attention_save_dir=attention_save_dir,
-                sample_idx=dataset_idx
-            )
+            try:
+                run_diffusion(
+                    brain_conditioning, dummy_img, models_dict,
+                    num_predictions=1,  # Only need one pass for attention
+                    noise_factor=args.noise_factor,
+                    save_attention=save_attention,
+                    attention_save_dir=attention_save_dir,
+                    sample_idx=dataset_idx,
+                    save_freq=save_freq
+                )
+            except Exception as e:
+                print(f"Error processing sample {dataset_idx}: {e}")
+                continue
             
             # Clean up
-            del brain_data, brain_conditioning
+            del brain_data, brain_conditioning, dummy_img
             torch.cuda.empty_cache()
+        
+        # Close the extraction progress bar
+        extraction_pbar.close()
     
     return dataset_indices
 
@@ -686,7 +777,10 @@ def main():
     print("=== Brain Adapter Attention Extraction Configuration ===")
     print(f"Model weights: {args.model_weights_dir}")
     print(f"Checkpoint: {args.saved_epochs}")
-    print(f"Sample range: Indices {args.start_idx}-{args.end_idx}")
+    if args.selected_idx is not None:
+        print(f"Selected indices: {args.selected_idx}")
+    else:
+        print(f"Sample range: Indices {args.start_idx}-{args.end_idx}")
     print(f"Max samples: {args.max_samples if args.max_samples else 'No limit'}")
     print(f"Subject ID: {args.subject_id}")
     print(f"Multi-subject training: {args.multi_subject_training}")
@@ -811,9 +905,11 @@ def main():
     # Extract attention maps
     try:
         dataset_indices = extract_attention_maps(
+            args,
             dataloader, models_dict, dataset,
             save_attention=True,
-            attention_save_dir=attention_save_dir
+            attention_save_dir=attention_save_dir,
+            save_freq=args.save_frequency
         )
         print("Attention extraction completed successfully")
     except Exception as e:
@@ -872,13 +968,20 @@ def create_argument_parser():
         "--start_idx", 
         type=int, 
         default=0,
-        help="Starting sample index"
+        help="Starting sample index (ignored if --selected_idx is used)"
     )
     parser.add_argument(
         "--end_idx", 
         type=int, 
         default=5,
-        help="Ending sample index"
+        help="Ending sample index (ignored if --selected_idx is used)"
+    )
+    parser.add_argument(
+        "--selected_idx",
+        type=int,
+        nargs='+',
+        default=None,
+        help="Specific sample indices to process (e.g., --selected_idx 1 3 5 6). Overrides start_idx/end_idx"
     )
     parser.add_argument(
         "--max_samples",
@@ -927,12 +1030,24 @@ def create_argument_parser():
         help="Number of diffusion denoising steps"
     )
     
-    # Output directory
+    # Output and storage options
     parser.add_argument(
         "--output_dir",
         type=str,
         default="brain_adapter/attn_maps",
         help="Base directory to save attention maps"
+    )
+    parser.add_argument(
+        "--save_frequency",
+        type=int,
+        default=5,
+        help="Save attention maps and images every N timesteps (lower = more storage, higher = less detail)"
+    )
+    parser.add_argument(
+        "--compress_attention",
+        action="store_true",
+        default=True,
+        help="Use float16 compression for attention maps (halves storage)"
     )
 
     return parser
@@ -943,20 +1058,33 @@ if __name__ == "__main__":
     """
     Usage Examples:
     
-    # 1. Extract attention maps for specific indices (basic usage):
+    # 1. Extract attention maps for specific selected indices:
     python extract_brain_adapter.py \
-        --model_weights_dir brain_adapter/model_weights/08_14_2025-00_21 \
+        --model_weights_dir brain_adapter/model_weights/08_16_2025-18_03 \
         --saved_epochs 200 \
-        --start_idx 0 \
-        --end_idx 8 \
+        --selected_idx 105 6 484 432 \
         --subject_id 1 \
-        --noise_factor 3.0 \
+        --noise_factor 4.0 \
+        --topk 100 \
+        --condition_dim 768 \
+        --sub_approach linear_projection \
+        --save_frequency 1
+    
+    # 2. Extract attention maps for range-based selection (original behavior):
+    python extract_brain_adapter.py \
+        --model_weights_dir brain_adapter/model_weights/08_16_2025-18_03 \
+        --saved_epochs 200 \
+        --start_idx 6 \
+        --end_idx 7 \
+        --subject_id 1 \
+        --noise_factor 4.0 \
         --topk 100 \
         --num_decoder_queries 50 \
         --condition_dim 768 \
-        --sub_approach linear_projection
+        --sub_approach linear_projection \
+        --save_frequency 5
     
-    # 2. Extract attention maps for larger sample range:
+    # 3. Extract attention maps for larger sample range:
     python extract_brain_adapter.py \
         --model_weights_dir brain_adapter/model_weights/08_10_2025-15_50 \
         --saved_epochs 100 \
@@ -970,13 +1098,12 @@ if __name__ == "__main__":
         --condition_dim 768 \
         --sub_approach transformer_decoder
     
-    # 3. Multi-subject training model attention extraction:
+    # 4. Multi-subject training model attention extraction with selected indices:
     python extract_brain_adapter.py \
         --model_weights_dir brain_adapter/model_weights/08_10_2025-15_50 \
         --saved_epochs 100 \
         --multi_subject_training \
-        --start_idx 0 \
-        --end_idx 8 \
+        --selected_idx 0 2 4 6 \
         --subject_id 1 \
         --noise_factor 2.0 \
         --topk 100 \
@@ -984,7 +1111,7 @@ if __name__ == "__main__":
         --condition_dim 768 \
         --sub_approach linear_projection
     
-    # 4. Different noise factor for attention extraction:
+    # 5. Different noise factor for attention extraction:
     python extract_brain_adapter.py \
         --model_weights_dir brain_adapter/model_weights/08_03_2025-17_39 \
         --saved_epochs 200 \
@@ -1104,5 +1231,4 @@ if len(files) > 10:
 total_size = sum(os.path.getsize(f) for f in files) / (1024**2)
 print(f'\\nTotal: {total_size:.1f}MB, Avg: {total_size/len(files):.1f}MB per file')
 
-"
-    """
+"""

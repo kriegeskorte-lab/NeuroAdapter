@@ -279,6 +279,41 @@ def apply_fmri_token_dropout(condition_tokens):
     roi_mask = (torch.rand(B, N) <= ratios).to(condition_tokens.device)
     roi_mask = roi_mask.view(B, N, 1)
     return condition_tokens * roi_mask
+
+def apply_feature_dropout(condition_tokens, dropout_prob=0.5):
+    """
+    Apply random dropout to features inside each parcel token.
+    
+    Args:
+        condition_tokens: (B, N, f) tensor
+        dropout_prob: probability of dropping a feature
+
+    Returns:
+        masked_tokens: (B, N, f) tensor
+    """
+    if dropout_prob <= 0:
+        return condition_tokens
+    mask = (torch.rand_like(condition_tokens) > dropout_prob).float()
+    return condition_tokens * mask
+
+def apply_vertex_feature_dropout(vertex_data, dropout_prob=0.5):
+    """
+    Apply random dropout to vertices within each parcel.
+
+    Args:
+        vertex_data: (B, N, V) tensor
+            B = batch size
+            N = number of parcels
+            V = number of vertices per parcel (padded to vmax)
+        dropout_prob: probability of dropping a vertex
+
+    Returns:
+        masked_vertex_data: (B, N, V) tensor
+    """
+    if dropout_prob <= 0:
+        return vertex_data
+    mask = (torch.rand_like(vertex_data) > dropout_prob).float()
+    return vertex_data * mask
  
 
 def process_training_batch(batch, vae, noise_scheduler, text_encoder, guidance_generator, 
@@ -311,6 +346,7 @@ def process_training_batch(batch, vae, noise_scheduler, text_encoder, guidance_g
     assert brain_data.shape[1] == train_dataset.num_parcels, f"Expected {train_dataset.num_parcels} parcels, got {brain_data.shape[1]}"
     assert brain_data.shape[2] == train_dataset.max_voxels, f"Expected {train_dataset.max_voxels} voxels, got {brain_data.shape[2]}"
     
+    # brain_data = apply_vertex_feature_dropout(brain_data, dropout_prob=0.25)
     # Generate conditioning tokens from brain data
     # Linear projection: [B, parcels, V] → [B, parcels, 768]
     condition_tokens, _ = guidance_generator(brain_data)
@@ -379,7 +415,8 @@ def training_loop(args, accelerator, neuro_adapter, guidance_generator, train_da
                 
                 optimizer.step()
                 optimizer.zero_grad()
-                lr_scheduler.step()
+                if lr_scheduler:
+                    lr_scheduler.step()
 
                 # Logging
                 if accelerator.is_main_process and args.wandb and step % 100 == 0:
@@ -463,11 +500,12 @@ def main(args):
     # Set up learning rate scheduler
     steps_per_epoch = len(train_dataloader)
     # lr_scheduler = StepLR(optimizer, step_size=25*steps_per_epoch, gamma=0.5)
-    lr_scheduler = get_cosine_schedule_with_warmup(
-        optimizer,
-        num_warmup_steps=0.1 * args.num_train_epochs * steps_per_epoch,
-        num_training_steps=args.num_train_epochs * steps_per_epoch
-    )
+    # lr_scheduler = get_cosine_schedule_with_warmup(
+    #     optimizer,
+    #     num_warmup_steps=0.1 * args.num_train_epochs * steps_per_epoch,
+    #     num_training_steps=args.num_train_epochs * steps_per_epoch
+    # )
+    lr_scheduler = None
     
     # Start training
     accelerator.print("Starting training...")
@@ -537,7 +575,7 @@ def create_argument_parser():
     parser.add_argument(
         "--weight_decay", 
         type=float, 
-        default=1e-5, 
+        default=1e-6, 
         help="Weight decay for regularization."
     )
     parser.add_argument(
@@ -700,8 +738,7 @@ accelerate launch --config_file acc_config.yaml train_brain_adapter.py \
     --subject_id 1 \
     --topk 100 \
     --condition_dim 768 \
-    --num_decoder_queries 50 \
-    --sub_approach linear_projection \
+    --sub_approach linear_projection
     
 accelerate launch --config_file acc_config.yaml --num_processes 4 train_brain_adapter.py \
     --learning_rate 0 \

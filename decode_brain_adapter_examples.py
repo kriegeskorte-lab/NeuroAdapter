@@ -18,7 +18,6 @@ import argparse
 from pathlib import Path
 from types import SimpleNamespace
 import warnings
-import time
 
 # Third-party imports
 import numpy as np
@@ -27,6 +26,8 @@ import torch.nn.functional as F
 from torch import nn
 from tqdm import tqdm
 from torchvision import transforms
+from PIL import Image
+import matplotlib.pyplot as plt
 
 # Diffusion imports
 from diffusers import AutoencoderKL, DDPMScheduler, UNet2DConditionModel
@@ -46,7 +47,7 @@ else:
     from brain_adapter.ip_adapter.attention_processor import IPAttnProcessor, AttnProcessor
 
 from brain_adapter.model import GuidanceGenerator
-from brain_adapter.dataset import nsd_topk_parcel_dataset  # multi-subject removed
+from brain_adapter.dataset import nsd_topk_parcel_dataset, nsd_groupwise_topk_parcel_dataset, get_dominant_roi_per_parcel
 
 # os.chdir("/engram/nklab/pf2477/brain_decoding/whole_brain_encoder")
 from whole_brain_encoder.brain_encoder_wrapper import BrainEncoderWrapper
@@ -252,34 +253,23 @@ def setup_ip_adapter_modules(args, unet, num_tokens=200):
     
     return image_proj_model, adapter_modules
 
-def freeze_models(*models):
-    """Freeze all parameters in the given models for inference."""
-    for model in models:
-        model.eval()
-        for param in model.parameters():
-            param.requires_grad = False
 
 def create_test_dataset(
     args,
     tokenizer, 
     topk=100, 
-    eval_full_dataset=False,
-    start_idx=0, 
-    end_idx=8, 
-    max_samples=None,
     batch_size=1, 
+    num_workers=0
 ):
     """
-    Create test dataset and dataloader with flexible evaluation options.
+    Create test dataset and dataloader for specific image indices.
     
     Args:
+        args: Command line arguments containing img_idx list
         tokenizer: CLIP tokenizer for text processing
         topk: Number of top parcels to use per hemisphere
-        eval_full_dataset: If True, use entire test dataset
-        start_idx: Starting index (only used if eval_full_dataset=False)
-        end_idx: Ending index (only used if eval_full_dataset=False)
-        max_samples: Maximum number of samples to evaluate (None = no limit)
         batch_size: Batch size for dataloader
+        num_workers: Number of workers for dataloader
         
     Returns:
         Tuple of (test_dataset, test_dataloader, actual_indices)
@@ -295,37 +285,24 @@ def create_test_dataset(
         gen_size=512,
     )
 
-    test_dataset = nsd_topk_parcel_dataset(dataset_args, split="test", transform=None, topk=topk)
+    if args.multi_subject_training:
+        test_dataset = nsd_groupwise_topk_parcel_dataset(
+            dataset_args, split="test", transform=None, topk=topk, test_subj=args.subject_id)
+    else:
+        test_dataset = nsd_topk_parcel_dataset(dataset_args, split="test", transform=None, topk=topk)
     total_samples = len(test_dataset)
     
     print(f"Test dataset created with {total_samples} total samples, using top {topk} parcels per hemisphere.")
     
-    # Determine evaluation indices
-    if eval_full_dataset:
-        print("Evaluating on FULL test dataset")
-        indices = list(range(total_samples))
-        if max_samples is not None and max_samples < total_samples:
-            indices = indices[:max_samples]
-            print(f"Limited to first {max_samples} samples")
-        actual_start, actual_end = 0, len(indices)
-    else:
-        print(f"Evaluating on SUBSET: indices {start_idx} to {end_idx}")
-        # Validate indices
-        if end_idx > total_samples:
-            print(f"Warning: end_idx ({end_idx}) exceeds dataset size ({total_samples}). Adjusting to {total_samples}")
-            end_idx = total_samples
-        if start_idx >= total_samples:
-            raise ValueError(f"start_idx ({start_idx}) exceeds dataset size ({total_samples})")
-        if start_idx >= end_idx:
-            raise ValueError(f"start_idx ({start_idx}) must be less than end_idx ({end_idx})")
-            
-        indices = list(range(start_idx, end_idx))
-        if max_samples is not None and len(indices) > max_samples:
-            indices = indices[:max_samples]
-            print(f"Limited to first {max_samples} samples from specified range")
-        actual_start, actual_end = indices[0], indices[-1] + 1
-
-    print(f"Final evaluation: {len(indices)} samples (indices {actual_start} to {actual_end-1})")
+    # Use specified image indices
+    indices = args.img_idx
+    
+    # Validate indices
+    invalid_indices = [idx for idx in indices if idx >= total_samples or idx < 0]
+    if invalid_indices:
+        raise ValueError(f"Invalid indices {invalid_indices}. Dataset has {total_samples} samples (indices 0-{total_samples-1})")
+    
+    print(f"Processing {len(indices)} specific indices: {indices}")
 
     # Create subset and dataloader
     test_subset = torch.utils.data.Subset(test_dataset, indices)
@@ -333,11 +310,10 @@ def create_test_dataset(
         test_subset,
         shuffle=False,
         batch_size=batch_size,
-        num_workers=args.num_workers,
-        pin_memory=(torch.cuda.is_available()),
+        num_workers=num_workers,
     )
     
-    return test_dataset, test_dataloader, (actual_start, actual_end)
+    return test_dataset, test_dataloader, indices
 
 
 def setup_device():
@@ -349,13 +325,7 @@ def setup_device():
 
 def validate_arguments(args):
     """Validate and process command line arguments."""
-    # Handle evaluation mode logic
-    if args.eval_full_dataset:
-        print("Mode: Full dataset evaluation")
-        if args.max_samples:
-            print(f"  - Limited to first {args.max_samples} samples")
-    else:
-        print(f"Mode: Index-based evaluation ({args.start_idx} to {args.end_idx})")
+    print(f"Processing {len(args.img_idx)} specific image indices: {args.img_idx}")
         
     # Validate numerical arguments
     if args.num_predictions <= 0:
@@ -394,145 +364,155 @@ def cleanup_gpu_memory():
         torch.cuda.synchronize()
 
 
-def save_individual_results(
-    original_images, 
-    decoded_images, 
-    candidate_images_list,
-    correlation_scores_list,
-    save_dir, 
-    args, 
-    evaluation_indices,
-    dataset_indices,
-    processing_time=None,
-    state=None,
-    finalize=True
-):
+def save_images_as_png(original_images, decoded_images, args, dataset_indices, all_candidates=None):
     """
-    Save results individually for each sample with organized folder structure.
+    Save original and decoded images as PNG files with 600 DPI.
     
-    Supports streaming usage by reusing the returned state between calls and
-    writing metadata/summary only when finalize=True.
+    Args:
+        original_images: Ground truth images
+        decoded_images: Best decoded images or all candidates if save_all=True
+        args: Command line arguments
+        dataset_indices: Original dataset indices for each sample
+        all_candidates: All candidate images when save_all=True [N_samples, N_candidates, H, W, C]
     """
-    if state is None and original_images is None and finalize:
-        return None
-
-    if state is None:
-        epoch_dir = os.path.join(save_dir, f"epoch_{args.saved_epochs}")
-        Path(epoch_dir).mkdir(parents=True, exist_ok=True)
-
-        if args.eval_full_dataset:
-            eval_dir = os.path.join(epoch_dir, "full")
-            mode_name = "full_dataset"
-        else:
-            eval_dir = os.path.join(epoch_dir, "subset")
-            mode_name = f"subset_{evaluation_indices[0]}_{evaluation_indices[1]-1}"
-
-        Path(eval_dir).mkdir(parents=True, exist_ok=True)
-
-        global_metadata = {
-            'model_weights_dir': args.model_weights_dir,
-            'saved_epochs': args.saved_epochs,
-            'num_predictions': args.num_predictions,
-            'noise_factor': args.noise_factor,
-            'topk': args.topk,
-            'condition_dim': args.condition_dim,
-            'num_decoder_queries': args.num_decoder_queries,
-            'sub_approach': args.sub_approach,
-            'subject_id': args.subject_id,
-            'evaluation_mode': 'full_dataset' if args.eval_full_dataset else 'indices',
-            'start_idx': evaluation_indices[0],
-            'end_idx': evaluation_indices[1],
-            'num_samples': 0,
-            'timestamp': np.datetime64('now').astype(str),
-            'precision': args.precision,
-            'denoising_steps': args.denoising_steps,
-        }
-
-        state = {
-            'eval_dir': eval_dir,
-            'metadata_path': os.path.join(eval_dir, "evaluation_metadata.json"),
-            'summary_path': os.path.join(eval_dir, "sample_summary.json"),
-            'dataset_indices': [],
-            'sample_filenames': [],
-            'num_samples': 0,
-            'global_metadata': global_metadata,
-            'mode_name': mode_name,
-            'evaluation_indices': evaluation_indices,
-        }
-
-    sample_count = len(original_images) if original_images is not None else 0
-    if sample_count:
-        candidate_images_list = candidate_images_list or [None] * sample_count
-        correlation_scores_list = correlation_scores_list or [None] * sample_count
-        assert len(dataset_indices) == sample_count, "Dataset indices must match sample count"
-
-        for idx in range(sample_count):
-            orig_img = original_images[idx]
-            decoded_img = decoded_images[idx]
-            dataset_idx = int(dataset_indices[idx])
-            corr_scores = correlation_scores_list[idx]
-            corr_score_value = float(np.max(corr_scores)) if corr_scores is not None else None
-
-            sample_filename = f"sample_{dataset_idx:06d}.npz"
-            sample_path = os.path.join(state['eval_dir'], sample_filename)
-            eval_index = state['num_samples']
-
-            save_data = {
-                'groundtruth_image': orig_img.detach().cpu().numpy(),
-                'predicted_image': decoded_img.detach().cpu().numpy(),
-                'evaluation_index': eval_index,
-                'correlation_score': corr_score_value,
-            }
-
-            if args.save_all_candidates:
-                candidate_imgs = candidate_images_list[idx]
-                save_data['candidate_images'] = candidate_imgs
-                save_data['correlation_scores'] = corr_scores
-                save_data['best_candidate_idx'] = int(np.argmax(corr_scores))
-
-            np.savez_compressed(sample_path, **save_data)
-
-            state['dataset_indices'].append(dataset_idx)
-            state['sample_filenames'].append(sample_filename)
-            state['num_samples'] += 1
-
-            if state['num_samples'] % 50 == 0:
-                print(f"Saved {state['num_samples']} samples so far")
-
-    if finalize and state is not None:
-        import json
-
-        metadata = state['global_metadata']
-        metadata['num_samples'] = state['num_samples']
-        if processing_time is not None and state['num_samples'] > 0:
-            metadata['processing_time_seconds'] = processing_time
-            metadata['time_per_sample'] = processing_time / max(state['num_samples'], 1)
-
-        with open(state['metadata_path'], 'w') as f:
-            json.dump(metadata, f, indent=2)
-
-        summary_data = {
-            'evaluation_indices': state['evaluation_indices'],
-            'dataset_indices': state['dataset_indices'],
-            'sample_filenames': state['sample_filenames'],
-            'num_samples': state['num_samples'],
-            'mode': state['mode_name']
-        }
-        with open(state['summary_path'], 'w') as f:
-            json.dump(summary_data, f, indent=2)
-
-        print(f"\nResults saved successfully!")
-        print(f"Directory: {state['eval_dir']}")
-        print(f"Samples: {state['num_samples']}")
-        print(f"Metadata: {state['metadata_path']}")
-        print(f"Summary: {state['summary_path']}")
-
-        return state['eval_dir']
-
-    return state
+    # Create figures directory
+    figures_dir = os.path.join("/engram/nklab/pf2477/brain_decoding", "figures", str(args.subject_id))
+    Path(figures_dir).mkdir(parents=True, exist_ok=True)
+    
+    print(f"Saving images to: {figures_dir}")
+    
+    if args.save_all and all_candidates is not None:
+        # Save all candidate images
+        for i, (orig_img, candidates, dataset_idx) in enumerate(zip(original_images, all_candidates, dataset_indices)):
+            # Convert and save original image
+            if torch.is_tensor(orig_img):
+                orig_img_np = orig_img.permute(1, 2, 0).cpu().numpy()
+            else:
+                orig_img_np = orig_img
+            orig_img_np = np.clip(orig_img_np, 0, 1)
+            orig_pil = Image.fromarray((orig_img_np * 255).astype(np.uint8))
+            
+            # Save original image
+            orig_filename = f"{dataset_idx:06d}_original.png"
+            orig_path = os.path.join(figures_dir, orig_filename)
+            orig_pil.save(orig_path, dpi=(600, 600))
+            
+            # Save all candidate images
+            for cand_idx, candidate in enumerate(candidates):
+                if torch.is_tensor(candidate):
+                    cand_img_np = candidate.permute(1, 2, 0).cpu().numpy()
+                else:
+                    cand_img_np = candidate
+                cand_img_np = np.clip(cand_img_np, 0, 1)
+                cand_pil = Image.fromarray((cand_img_np * 255).astype(np.uint8))
+                
+                # Save candidate image
+                cand_filename = f"{dataset_idx:06d}_decoded_candidate_{cand_idx:02d}.png"
+                cand_path = os.path.join(figures_dir, cand_filename)
+                cand_pil.save(cand_path, dpi=(600, 600))
+            
+            if (i + 1) % 10 == 0 or i == len(original_images) - 1:
+                print(f"Saved {i + 1}/{len(original_images)} image sets (with {len(candidates)} candidates each)")
+    else:
+        # Save only best decoded images (original behavior)
+        for i, (orig_img, decoded_img, dataset_idx) in enumerate(zip(original_images, decoded_images, dataset_indices)):
+            # Convert tensors to numpy arrays and ensure proper format
+            if torch.is_tensor(orig_img):
+                orig_img_np = orig_img.permute(1, 2, 0).cpu().numpy()
+            else:
+                orig_img_np = orig_img
+            
+            if torch.is_tensor(decoded_img):
+                decoded_img_np = decoded_img.permute(1, 2, 0).cpu().numpy()
+            else:
+                decoded_img_np = decoded_img
+            
+            # Ensure values are in [0, 1] range
+            orig_img_np = np.clip(orig_img_np, 0, 1)
+            decoded_img_np = np.clip(decoded_img_np, 0, 1)
+            
+            # Convert to PIL Images
+            orig_pil = Image.fromarray((orig_img_np * 255).astype(np.uint8))
+            decoded_pil = Image.fromarray((decoded_img_np * 255).astype(np.uint8))
+            
+            # Save original image
+            orig_filename = f"{dataset_idx:06d}_original.png"
+            orig_path = os.path.join(figures_dir, orig_filename)
+            orig_pil.save(orig_path, dpi=(600, 600))
+            
+            # Save decoded image
+            decoded_filename = f"{dataset_idx:06d}_decoded.png"
+            decoded_path = os.path.join(figures_dir, decoded_filename)
+            decoded_pil.save(decoded_path, dpi=(600, 600))
+            
+            if (i + 1) % 50 == 0 or i == len(original_images) - 1:
+                print(f"Saved {i + 1}/{len(original_images)} image pairs")
+    
+    print(f"All images saved to: {figures_dir}")
+    return figures_dir
 
 
-def run_diffusion(brain_embeds, img_ip, models_dict, num_predictions=1, noise_factor=4.0, denoising_steps=50):
+def load_evaluation_results(results_dir):
+    """
+    Utility function to load and examine saved evaluation results.
+    
+    Args:
+        results_dir: Path to evaluation results directory (epoch_X/full or epoch_X/subset)
+        
+    Returns:
+        Dictionary with loaded results and metadata
+    """
+    import json
+    
+    # Load metadata
+    metadata_path = os.path.join(results_dir, "evaluation_metadata.json")
+    summary_path = os.path.join(results_dir, "sample_summary.json")
+    
+    if not os.path.exists(metadata_path):
+        raise FileNotFoundError(f"Metadata file not found: {metadata_path}")
+    if not os.path.exists(summary_path):
+        raise FileNotFoundError(f"Summary file not found: {summary_path}")
+    
+    with open(metadata_path, 'r') as f:
+        metadata = json.load(f)
+    
+    with open(summary_path, 'r') as f:
+        summary = json.load(f)
+    
+    print(f"Evaluation Results Summary:")
+    print(f"  Mode: {metadata['evaluation_mode']}")
+    print(f"  Samples: {metadata['num_samples']}")
+    print(f"  Epoch: {metadata['saved_epochs']}")
+    print(f"  Processing time: {metadata.get('processing_time_seconds', 'N/A')} seconds")
+    
+    # Load first sample as example
+    first_sample_file = summary['sample_filenames'][0]
+    first_sample_path = os.path.join(results_dir, first_sample_file)
+    
+    if os.path.exists(first_sample_path):
+        sample_data = np.load(first_sample_path, allow_pickle=True)
+        print(f"  Sample data keys: {list(sample_data.keys())}")
+        
+        if 'candidate_images' in sample_data:
+            print(f"  Includes candidate images: {sample_data['candidate_images'].shape}")
+        
+        sample_data.close()
+    
+    return {
+        'metadata': metadata,
+        'summary': summary,
+        'results_dir': results_dir
+    }
+
+
+def freeze_models(*models):
+    """Freeze all parameters in the given models for inference."""
+    for model in models:
+        model.eval()
+        for param in model.parameters():
+            param.requires_grad = False
+
+def run_diffusion(brain_embeds, img_ip, models_dict, num_predictions=1, noise_factor=4.0):
     """
     Run diffusion process with brain conditioning to generate images.
     
@@ -573,7 +553,7 @@ def run_diffusion(brain_embeds, img_ip, models_dict, num_predictions=1, noise_fa
     torch.cuda.empty_cache()
 
     # Setup diffusion timesteps
-    num_inference_steps = denoising_steps
+    num_inference_steps = 50
     noise_scheduler.set_timesteps(num_inference_steps)
     init_timestep = min(int(num_inference_steps * 1.0), num_inference_steps)
     t_start = max(num_inference_steps - init_timestep, 0)
@@ -615,18 +595,20 @@ def run_diffusion(brain_embeds, img_ip, models_dict, num_predictions=1, noise_fa
     # Decode latents to images
     latents = 1 / vae.config.scaling_factor * latents
     with torch.autocast(device_type=device.type):
-        pred_images = vae.decode(latents).sample
+        pred_image = vae.decode(latents).sample
 
     # Post-process images and move to CPU immediately
-    pred_images = (pred_images / 2 + 0.5).clamp(0, 1)
-    pred_images = pred_images.cpu().permute(0, 2, 3, 1).numpy()
-    pred_images = (pred_images * 255).round().astype("uint8")
+    pred_image = (pred_image / 2 + 0.5).clamp(0, 1)
+    pred_image = pred_image.cpu().permute(0, 2, 3, 1).numpy()
+    pred_image = (pred_image * 255).round().astype("uint8")
     
     # Clean up all intermediate tensors
     del latents, init_latents, encoder_hidden_states
     torch.cuda.empty_cache()
 
-    return pred_images
+    return pred_image
+
+
 
 
 
@@ -654,18 +636,6 @@ def compute_brain_correlation(ground_truth, predictions):
     return correlations
 
 
-def preprocess_image(image, target_size, device="cpu"):
-    """Preprocess image to target size."""
-    transform = transforms.Compose([
-        transforms.ToPILImage(),
-        transforms.Resize((target_size, target_size)),
-        transforms.ToTensor(),
-    ])
-
-    img_transformed = transform(image)
-    return img_transformed.to(device)
-
-
 def process_brain_data_for_correlation(batch, test_dataset, brain_encoder_predictions, device):
     """
     Process brain data and predictions to compute correlation scores.
@@ -687,8 +657,11 @@ def process_brain_data_for_correlation(batch, test_dataset, brain_encoder_predic
     
     for hemisphere in ["lh", "rh"]:
         for parcel_idx, parcel_id in enumerate(test_dataset.selected_parcel_idx[hemisphere]):
-
-            voxel_indices = test_dataset.parcels[hemisphere][parcel_id]
+            if test_dataset.__class__.__name__ == "nsd_groupwise_topk_parcel_dataset":
+                subject_id = test_dataset.subjects[0]
+                voxel_indices = test_dataset.parcels[subject_id][hemisphere][parcel_id]
+            else:   
+                voxel_indices = test_dataset.parcels[hemisphere][parcel_id]
             num_voxels = len(voxel_indices)
             
             # Ground truth brain activity for this parcel
@@ -711,13 +684,22 @@ def process_brain_data_for_correlation(batch, test_dataset, brain_encoder_predic
     return ground_truth, predictions
 
 
-def decode_images_from_brain(
-    dataloader, models_dict, brain_encoder, test_dataset, num_predictions=8,
-    noise_factor=4.0, save_all_candidates=False, denoising_steps=50, save_config=None
-):
-    """
-    Main function to decode images from brain signals with streaming saves.
+def preprocess_image(image, target_size, device="cpu"):
+    """Preprocess image to target size."""
+    transform = transforms.Compose([
+        transforms.ToPILImage(),
+        transforms.Resize((target_size, target_size)),
+        transforms.ToTensor(),
+    ])
 
+    img_transformed = transform(image)
+    return img_transformed.to(device)
+
+
+def decode_images_from_brain(dataloader, models_dict, brain_encoder, test_dataset, num_predictions=8, noise_factor=4.0, save_all=False):
+    """
+    Main function to decode images from brain signals.
+    
     Args:
         dataloader: DataLoader containing brain data
         models_dict: Dictionary with all necessary models
@@ -725,38 +707,40 @@ def decode_images_from_brain(
         test_dataset: Dataset instance for parcel information
         num_predictions: Number of candidate images per brain sample
         noise_factor: Guidance scale for diffusion
-        save_all_candidates: Whether to save all candidate images (for subset evaluation)
-        denoising_steps: Number of diffusion denoising steps
-        save_config: Dict with keys: base_save_dir, args, evaluation_indices, start_time
+        save_all: Whether to save all candidates or just the best one
         
     Returns:
-        Dict with keys: results_dir, num_samples, processing_time
+        Tuple of (original_images, decoded_images, dataset_indices, all_candidates)
+        all_candidates is None unless save_all=True
     """
-    results_state = None
-    samples_processed = 0
-    if 'start_time' not in save_config:
-        save_config['start_time'] = time.time()
-
+    original_images, decoded_images = [], []
+    dataset_indices = []
+    all_candidates = [] if save_all else None
+    
     device = models_dict['device']
     weight_dtype = models_dict['weight_dtype']
     guidance_generator = models_dict['guidance_generator']
     
     with torch.no_grad():
         for batch_idx, batch in enumerate(tqdm(dataloader, desc="Decoding brain signals")):
-            img = batch["img_encoder"].squeeze()
-            img_cpu = img.cpu()
-
+            # Get original image and move to CPU immediately
+            img = batch["img_encoder"].squeeze()  # Remove batch dimension
+            original_images.append(img.cpu())  # Ensure it's on CPU
+            
+            # Get dataset index for this sample
             if hasattr(dataloader.dataset, 'indices'):
+                # This is a Subset, get the original dataset index
                 dataset_idx = dataloader.dataset.indices[batch_idx]
             else:
                 dataset_idx = batch_idx
-            dataset_idx = int(dataset_idx)
+            dataset_indices.append(dataset_idx)
             
             # Process brain data
             lh = batch["brain_lh_f"].to(device, dtype=weight_dtype)
             rh = batch["brain_rh_f"].to(device, dtype=weight_dtype)
             brain_data = torch.cat([lh, rh], dim=1)
             
+            # Clean up individual hemisphere data
             del lh, rh
             
             # Validate brain data dimensions
@@ -767,6 +751,8 @@ def decode_images_from_brain(
 
             # Generate brain conditioning tokens
             brain_embeds, _ = guidance_generator(brain_data)
+            
+            # Clean up brain_data after getting embeddings
             del brain_data
 
             # Use zero-filled image as initialization (no image information)
@@ -775,11 +761,11 @@ def decode_images_from_brain(
 
             # Generate candidate images using diffusion
             candidate_images = run_diffusion(
-                brain_embeds, img_init, models_dict,
-                num_predictions=num_predictions, noise_factor=noise_factor,
-                denoising_steps=denoising_steps
+                brain_embeds, img_init, models_dict, 
+                num_predictions=num_predictions, noise_factor=noise_factor
             )
             
+            # Clean up after diffusion
             del brain_embeds, img_init
             torch.cuda.empty_cache()
 
@@ -791,20 +777,23 @@ def decode_images_from_brain(
                 batch, test_dataset, brain_predictions, device
             )
             correlations = compute_brain_correlation(ground_truth, predictions)
-            correlations_numpy = correlations.cpu().numpy()
-            best_idx = int(np.argmax(correlations_numpy))
-            best_image = candidate_images[best_idx]
-            best_image = preprocess_image(best_image, img.shape[-1], "cpu")
 
-            # Save results incrementally in the batch loop
-            candidates_payload = [candidate_images] if save_all_candidates else [None]
-            correlations_payload = [correlations_numpy]
-            results_state = save_individual_results(
-                [img_cpu], [best_image], candidates_payload, correlations_payload,
-                save_config['base_save_dir'], save_config['args'], save_config['evaluation_indices'],
-                [dataset_idx], state=results_state, finalize=False
-            )
-            samples_processed += 1
+            # Select best candidate based on highest correlation
+            best_idx = torch.argmax(correlations).item()
+            best_image = candidate_images[best_idx]
+            
+            # Preprocess to match original image size and move to CPU for consistency
+            best_image = preprocess_image(best_image, img.shape[-1], "cpu")
+            decoded_images.append(best_image)
+            
+            # Save all candidates if requested
+            if save_all:
+                processed_candidates = []
+                for candidate in candidate_images:
+                    processed_candidate = preprocess_image(candidate, img.shape[-1], "cpu")
+                    processed_candidates.append(processed_candidate)
+                all_candidates.append(torch.stack(processed_candidates))
+                print(correlations)
             
             # Clean up all GPU tensors for this iteration
             del brain_predictions, ground_truth, predictions, correlations
@@ -822,21 +811,14 @@ def decode_images_from_brain(
                 memory_reserved = torch.cuda.memory_reserved(device) / 1024**3
                 print(f"  Batch {batch_idx + 1}: GPU memory allocated: {memory_allocated:.2f}GB, reserved: {memory_reserved:.2f}GB")
 
-    # Finalize streaming save with metadata
-    processing_time = time.time() - save_config['start_time']
-    results_dir = None
-    if results_state is not None:
-        results_dir = save_individual_results(
-            None, None, None, None,
-            save_config['base_save_dir'], save_config['args'], save_config['evaluation_indices'],
-            [], processing_time=processing_time, state=results_state, finalize=True
-        )
+    # Stack all images
+    original_images = torch.stack(original_images, dim=0)
+    decoded_images = torch.stack(decoded_images, dim=0)
     
-    return {
-        'results_dir': results_dir,
-        'num_samples': samples_processed,
-        'processing_time': processing_time,
-    }
+    if save_all:
+        all_candidates = torch.stack(all_candidates, dim=0)
+    
+    return original_images, decoded_images, dataset_indices, all_candidates
 
 
 def main():
@@ -844,6 +826,7 @@ def main():
     # Setup device
     device = setup_device()
     
+    import time
     start_time = time.time()
     
     # Parse and validate arguments
@@ -854,21 +837,12 @@ def main():
     print("=== Brain Adapter Decoding Configuration ===")
     print(f"Model weights: {args.model_weights_dir}")
     print(f"Checkpoint: {args.saved_epochs}")
-    print(f"Evaluation mode: {'Full dataset' if args.eval_full_dataset else f'Indices {args.start_idx}-{args.end_idx}'}")
-    print(f"Max samples: {args.max_samples if args.max_samples else 'No limit'}")
+    print(f"Image indices: {args.img_idx}")
     print(f"Batch size: {args.batch_size}")
     print(f"Noise factor: {args.noise_factor}")
     print(f"Predictions per sample: {args.num_predictions}")
-    print(f"Denoising steps: {args.denoising_steps}")
     print(f"Top-k parcels: {args.topk}")
     print("=" * 50)
-
-    # For full dataset evaluation, reduce batch size and predictions to save memory
-    if args.eval_full_dataset and args.batch_size > 1:
-        print(f"Warning: For full dataset evaluation, consider using batch_size=1 to avoid memory issues")
-    
-    if args.eval_full_dataset and args.num_predictions > 4:
-        print(f"Warning: For full dataset evaluation, consider reducing num_predictions to 4 or less")
     
     # Load pre-trained models
     print("Loading diffusion models...")
@@ -880,19 +854,15 @@ def main():
     
     # Create test dataset with flexible evaluation
     print("Creating test dataset...")
-    test_dataset, test_dataloader, evaluation_indices = create_test_dataset(
+    test_dataset, test_dataloader, dataset_indices = create_test_dataset(
         args,
         tokenizer, 
-        topk=args.topk, 
-        eval_full_dataset=args.eval_full_dataset,
-        start_idx=args.start_idx, 
-        end_idx=args.end_idx,
-        max_samples=args.max_samples,
+        topk=args.topk,
         batch_size=args.batch_size
     )
     
     # Estimate memory usage
-    num_samples = evaluation_indices[1] - evaluation_indices[0]
+    num_samples = len(dataset_indices)
     estimate_memory_usage(num_samples, args.num_predictions)
     
     # Create brain adapter and guidance generator
@@ -949,7 +919,7 @@ def main():
     original_cwd = os.getcwd()
     try:
         os.chdir("/engram/nklab/pf2477/brain_decoding/whole_brain_encoder")
-        brain_encoder = BrainEncoderWrapper(num_gpus=args.num_gpus, subj=args.subject_id)
+        brain_encoder = BrainEncoderWrapper(num_gpus=1, subj=args.subject_id)
         print("Brain encoder loaded successfully")
     except Exception as e:
         print(f"Error loading brain encoder: {e}")
@@ -970,80 +940,51 @@ def main():
         'brain_adapter': brain_adapter,
         'guidance_generator': guidance_generator,
         'device': device,
-        'weight_dtype': weight_dtype,
+        'weight_dtype': weight_dtype
     }
 
     # Run decoding
     print(f"\nStarting image decoding from brain signals...")
     print(f"Processing {num_samples} samples with {args.num_predictions} predictions each...")
     
-    # # Determine whether to save all candidates
-    # save_candidates = args.save_all_candidates and not args.eval_full_dataset
-    # if args.save_all_candidates and args.eval_full_dataset:
-    #     print("Warning: --save_all_candidates ignored for full dataset evaluation due to storage constraints")
-    save_candidates = args.save_all_candidates
+    try:
+        original_images, decoded_images, dataset_indices, all_candidates = decode_images_from_brain(
+            test_dataloader, models_dict, brain_encoder, test_dataset,
+            num_predictions=args.num_predictions, noise_factor=args.noise_factor, save_all=args.save_all
+        )
+        print("Decoding completed successfully")
+    except Exception as e:
+        print(f"Error during decoding: {e}")
+        return 1
+    finally:
+        cleanup_gpu_memory()
 
-    brain_decoding_dir = "/engram/nklab/pf2477/brain_decoding/"
-    if not os.path.exists(brain_decoding_dir):
-        brain_decoding_dir = os.getcwd()
-    os.chdir(brain_decoding_dir)
-    base_save_dir = os.path.join(args.decoded_stimuli_dir, args.model_weights_dir.split("/")[-1])
+    # Calculate processing time
+    processing_time = time.time() - start_time
+    print(f"Total processing time: {processing_time:.1f} seconds ({processing_time/60:.1f} minutes)")
+    print(f"Time per sample: {processing_time/len(original_images):.1f} seconds")
 
-    # Setup save configuration for streaming mode
-    save_context = {
-        'base_save_dir': base_save_dir,
-        'args': args,
-        'evaluation_indices': evaluation_indices,
-        'start_time': start_time,
-    }
+    # Save results as PNG images
+    figures_dir = save_images_as_png(original_images, decoded_images, args, dataset_indices, all_candidates)
 
-    # Call decode_images_from_brain with save_config for incremental saving
-    results_output = decode_images_from_brain(
-        test_dataloader, models_dict, brain_encoder, test_dataset,
-        num_predictions=args.num_predictions, noise_factor=args.noise_factor,
-        save_all_candidates=save_candidates, denoising_steps=args.denoising_steps,
-        save_config=save_context
-    )
-    print("Decoding completed successfully")
-    cleanup_gpu_memory()
-
-    # Extract results
-    processing_time = results_output.get('processing_time', time.time() - start_time)
-    num_samples = results_output.get('num_samples', 0)
-    results_dir = results_output.get('results_dir')
-
-    if num_samples > 0:
-        print(f"Total processing time: {processing_time:.1f} seconds ({processing_time/60:.1f} minutes)")
-        print(f"Time per sample: {processing_time/num_samples:.1f} seconds")
-    else:
-        print("No samples were processed.")
-    
-    if results_dir:
-        print(f"\nDecoding completed successfully!")
-        print(f"Results directory: {results_dir}")
-        print(f"Processed {num_samples} samples in {processing_time/60:.1f} minutes")
-        print(f"Individual files saved for each sample")
-    else:
-        print("No results directory was created.")
+    print(f"\nDecoding completed successfully!")
+    print(f"Images saved to: {figures_dir}")
+    print(f"Processed {len(original_images)} samples in {processing_time/60:.1f} minutes")
 
     return 0
     
     
 def create_argument_parser():
+    """Create and configure the argument parser for decoding."""
     parser = argparse.ArgumentParser(
         description="Decode images from brain signals using trained Brain Adapter model"
     )
+    
     parser.add_argument(
         "--model_weights_dir", 
         type=str, 
         default="brain_adapter/model_weights/06_27_2025-21_15",
         help="Directory containing trained model weights"
-    )
-    parser.add_argument(
-        "--decoded_stimuli_dir", 
-        type=str, 
-        default="./brain_adapter/decoded_stimuli",
-        help="Directory to save decoded images"
     )
     parser.add_argument(
         "--saved_epochs", 
@@ -1058,55 +999,30 @@ def create_argument_parser():
         help="Number of candidate images to generate per brain sample"
     )
     
-    # Evaluation mode selection
-    eval_group = parser.add_mutually_exclusive_group()
-    eval_group.add_argument(
-        "--eval_full_dataset",
-        action="store_true",
-        help="Evaluate on the entire test dataset (ignores start_idx/end_idx)"
-    )
-    eval_group.add_argument(
-        "--eval_indices",
-        action="store_true", 
-        default=True,
-        help="Evaluate on specific indices (default behavior)"
+    parser.add_argument(
+        "--img_idx",
+        type=int,
+        nargs='+',
+        required=True,
+        help="List of image indices to decode (e.g., --img_idx 0 1 2 5 10)"
     )
 
     parser.add_argument(
-        "--start_idx", 
-        type=int, 
-        default=0,
-        help="Starting index for test samples (only used with --eval_indices)"
-    )
-    parser.add_argument(
-        "--end_idx", 
-        type=int, 
-        default=8,
-        help="Ending index for test samples (only used with --eval_indices)"
+        "--multi_subject_training",
+        action="store_true",
+        help="Replace the dataset with shared parcel indices for multi-subject training"
     )
     parser.add_argument(
         "--batch_size",
         type=int,
         default=1,
-        help="Batch size for evaluation (useful for full dataset evaluation)"
-    )
-    parser.add_argument(
-        "--max_samples",
-        type=int,
-        default=None,
-        help="Maximum number of samples to evaluate (None = no limit)"
+        help="Batch size for evaluation"
     )
     parser.add_argument(
         "--noise_factor", 
         type=float, 
         default=1.0,
         help="Classifier-free guidance scale for diffusion"
-    )
-    parser.add_argument(
-        "--num_gpus",
-        type=int,
-        default=1,
-        help="Number of GPUs to use for decoding"
     )
     parser.add_argument(
         "--subject_id",
@@ -1139,29 +1055,9 @@ def create_argument_parser():
         help="Sub-approach for training. Options: 'linear_projection', 'masking + transformer_decoder'"
     )
     parser.add_argument(
-        "--save_all_candidates",
+        "--save_all",
         action="store_true",
-        default=False,
-        help="Save all candidate images for subset evaluation (not recommended for full dataset due to storage)"
-    )
-    parser.add_argument(
-        "--precision",
-        type=str,
-        default="auto",
-        choices=["auto", "fp16", "fp32", "bf16"],
-        help="Inference precision (auto tries bf16 then fp16 on CUDA)."
-    )
-    parser.add_argument(
-        "--num_workers",
-        type=int,
-        default=0,
-        help="DataLoader workers."
-    )
-    parser.add_argument(
-        "--denoising_steps",
-        type=int,
-        default=50,
-        help="Number of diffusion denoising steps."
+        help="Save all candidate images instead of just the best one"
     )
 
     return parser
@@ -1170,25 +1066,35 @@ def create_argument_parser():
 if __name__ == "__main__":
     main()
     """
-    Usage Examples (multi-subject removed):
-    python decode_brain_adapter_2.py \
+    Usage Examples:
+    
+    # 1. Decode specific image indices (save only best):
+    python decode_brain_adapte_examples.py \
         --model_weights_dir brain_adapter/model_weights/08_16_2025-18_03 \
         --saved_epochs 200 \
-        --start_idx 128 \
-        --end_idx 192 \
-        --num_predictions 2 \
+        --img_idx 0 1 2 5 10 128 256 \
+        --num_predictions 8 \
         --noise_factor 4.0 \
-        --precision auto \
-        --subject_id 1 \
-        --topk 100
-
-    python decode_brain_adapter_2.py \
-        --model_weights_dir brain_adapter/model_weights/08_14_2025-00_21 \
-        --saved_epochs 200 \
-        --eval_full_dataset \
-        --num_predictions 4 \
-        --noise_factor 2.0 \
-        --precision fp16 \
-        --subject_id 1 \
-        --topk 100
+        --subject_id 1
+    
+    # 2. Save all candidate images:
+    python decode_brain_adapte_examples.py \
+        --model_weights_dir brain_adapter/model_weights/09_20_2025-21_34 \
+        --saved_epochs 300 \
+        --img_idx 507 \
+        --num_predictions 8 \
+        --save_all \
+        --subject_id 1
+        
+    # Output Structure (with --save_all):
+    # figures/
+    # └── {subject_id}/
+    #     ├── 000000_original.png
+    #     ├── 000000_decoded_candidate_00.png
+    #     ├── 000000_decoded_candidate_01.png
+    #     ├── ...
+    #     ├── 000000_decoded_candidate_07.png
+    #     ├── 000001_original.png
+    #     ├── 000001_decoded_candidate_00.png
+    #     └── ...
     """

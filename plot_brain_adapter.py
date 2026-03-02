@@ -348,7 +348,7 @@ def plot_candidates_comparison(sample_data, save_path=None):
     # Save if path provided
     if save_path:
         Path(save_path).parent.mkdir(parents=True, exist_ok=True)
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.savefig(save_path, dpi=600, bbox_inches='tight')
         print(f"Saved candidates plot: {save_path}")
     
     return fig
@@ -566,7 +566,11 @@ if __name__ == "__main__":
 
     # 2. Plot specific range of samples:
     python plot_brain_adapter.py \
-        --results_dir brain_adapter/decoded_stimuli/08_14_2025-00_21/epoch_200/subset \
+        --results_dir brain_adapter/decoded_stimuli/08_16_2025-18_03/epoch_200/subset \
+        --start_idx 0 --end_idx 4
+        
+    python plot_brain_adapter.py \
+        --results_dir brain_adapter/decoded_stimuli_masking/08_16_2025-18_03/epoch_200/subset \
         --start_idx 0 --end_idx 8
     
     # 3. Plot only grid comparison:
