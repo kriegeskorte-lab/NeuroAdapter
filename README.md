@@ -166,33 +166,21 @@ brain_adapter/
 ## 📄 License
 
 This project is licensed under the MIT License 
-<!-- 
-## 🙏 Acknowledgments
-
-- [Natural Scenes Dataset](https://naturalscenesdataset.org/) for providing the fMRI data
-- [IP-Adapter](https://github.com/tencent-ailab/IP-Adapter) for the adapter architecture
-- [Stable Diffusion](https://github.com/CompVis/stable-diffusion) for the base diffusion model
-- [Hugging Face](https://huggingface.co/) for model hosting and utilities
 
 ## 📚 Citation
 
 If you use this code in your research, please cite:
 
 ```bibtex
-@misc{brain_adapter_2025,
-  title={Brain Adapter: fMRI-to-Image Generation using Diffusion Models},
-  author={Your Name},
-  year={2025},
-  url={https://github.com/your-username/brain_decoding}
+@inproceedings{
+    feng2026towards,
+    title={Towards Interpretable Visual Decoding with Attention to Brain Representations},
+    author={Pinyuan Feng and Hossein Adeli and Wenxuan Guo and Fan Cheng and Ethan Hwang and Nikolaus Kriegeskorte},
+    booktitle={The Fourteenth International Conference on Learning Representations},
+    year={2026},
+    url={https://openreview.net/forum?id=YWlYITAhMC}
 }
 ```
-
-## 📧 Contact
-
-- **Author**: Your Name
-- **Email**: your.email@domain.com
-- **Project Link**: [https://github.com/your-username/brain_decoding](https://github.com/your-username/brain_decoding)
-
 ---
- -->
+
 
