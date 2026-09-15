@@ -169,8 +169,6 @@ This project is licensed under the MIT License
 
 ## 📚 Citation
 
-If you use this code in your research, please cite:
-
 ```bibtex
 @inproceedings{
     feng2026towards,
